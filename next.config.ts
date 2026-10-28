@@ -6,7 +6,7 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
-  serverExternalPackages: ["pdf-parse", "mammoth", "z-ai-web-dev-sdk"],
+  serverExternalPackages: ["pdfjs-dist", "mammoth", "z-ai-web-dev-sdk"],
 };
 
 export default nextConfig;

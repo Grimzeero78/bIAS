@@ -75,6 +75,11 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
             finalScore: c.evaluation.finalScore,
             rank: c.evaluation.rank,
             justification: c.evaluation.justification,
+            improvement: parse(c.evaluation.improvementJson, null),
+            decision: c.evaluation.decision,
+            decisionNote: c.evaluation.decisionNote,
+            decidedByName: c.evaluation.decidedByName,
+            decidedAt: c.evaluation.decidedAt,
             flags: parse(c.evaluation.flagsJson, { breaches: [] }),
             computedAt: c.evaluation.computedAt,
           }

@@ -4,6 +4,7 @@ import { requireUser, getSessionUser } from "@/lib/auth";
 import { api } from "@/lib/api-helpers";
 import { HttpError } from "@/lib/auth";
 import { audit } from "@/lib/audit";
+import { enqueueAnalysis, isRunning } from "@/lib/pipeline";
 
 export const runtime = "nodejs";
 
@@ -39,13 +40,25 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ candidateI
       if (!cand.job.candidateVisibility) throw new HttpError(403, "The employer has not enabled candidate score visibility for this role");
     } else if (user.role === "INTERVIEWER" && cand.job.createdById !== user.id) {
       throw new HttpError(403, "You do not own this candidate's job opening");
-    } else if (user.role !== "ADMIN" && user.role !== "CANDIDATE" && user.role !== "INTERVIEWER") {
-      throw new HttpError(403, "Access denied");
+    }
+
+    // Self-heal on serverless: a PENDING job with nothing in flight (e.g. its
+    // waitUntil lifetime expired on Workers) resumes on this poll.
+    if (cand.cvAnalysis?.status === "PENDING" && !isRunning(candidateId, "CV")) {
+      enqueueAnalysis(candidateId, "CV");
+    }
+    if (cand.videoAnalysis?.status === "PENDING" && !isRunning(candidateId, "VIDEO")) {
+      enqueueAnalysis(candidateId, "VIDEO");
     }
 
     if (user.role === "CANDIDATE" && cand.evaluation) {
       await audit(user, "VIEW_OWN_REPORT", "CANDIDATE", candidateId);
     }
+
+    // ranking context: "position X of N" for the candidate's own cohort
+    const rankedCount = await db.evaluation.count({
+      where: { candidate: { jobId: cand.jobId, status: "ACTIVE" }, rank: { not: null } },
+    });
 
     return {
       candidate: { id: cand.id, fullName: cand.fullName, status: cand.status },
@@ -74,7 +87,13 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ candidateI
         videoScore: cand.evaluation.videoScore,
         finalScore: cand.evaluation.finalScore,
         rank: cand.evaluation.rank,
+        rankedTotal: rankedCount,
         justification: cand.evaluation.justification,
+        improvement: parse(cand.evaluation.improvementJson, null),
+        decision: cand.evaluation.decision,
+        decisionNote: user.role === "CANDIDATE" ? null : cand.evaluation.decisionNote,
+        decidedByName: user.role === "CANDIDATE" ? null : cand.evaluation.decidedByName,
+        decidedAt: cand.evaluation.decidedAt,
         flags: parse(cand.evaluation.flagsJson, { breaches: [] }),
         computedAt: cand.evaluation.computedAt,
       },

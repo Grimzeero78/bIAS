@@ -1,6 +1,11 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
 }
+
+// Derived at cf:build time (scripts/make_cf_schema.mjs patches the generator
+// block above) so the Cloudflare client uses the JS query compiler (WASM)
+// instead of the Rust engine, which cannot run inside workerd.
 
 // SQLite for this sandbox. To move to PostgreSQL in production:
 // change provider to "postgresql" and keep the schema as-is
@@ -37,7 +42,7 @@ model JobOpening {
   cvWeight           Int       @default(40) // % weight of CV score 0-100
   videoWeight        Int       @default(60) // % weight of Video score 0-100
   status             String    @default("OPEN") // OPEN | CLOSED
-  candidateVisibility Boolean  @default(false) // may candidates view their own report?
+  candidateVisibility Boolean  @default(true) // may candidates view their own report?
   createdById        String
   createdByName      String
   createdAt          DateTime  @default(now())
@@ -121,6 +126,7 @@ model VideoAnalysis {
   framesJson      String? // [{t, path}] extracted frame timestamps
   scoresJson      String? // [{criterionId, name, score, rationale}]
   observationsJson String? // [{timestamp, category, observation}] timestamped evidence
+  precomputedKey  String? // storage key of a browser-prepared frames+audio manifest (edge deployments)
   overallScore    Float?
   error           String?
   processedAt     DateTime?
@@ -131,16 +137,21 @@ model VideoAnalysis {
 // FINAL EVALUATION / RANKING
 // ─────────────────────────────────────────────────────────────
 model Evaluation {
-  id            String    @id @default(cuid())
-  candidateId   String    @unique
-  cvScore       Float
-  videoScore    Float
-  finalScore    Float
-  rank          Int? // 1 = best
-  justification String? // AI "Why" narrative
-  flagsJson     String? // mandatory-criterion breaches etc.
-  computedAt    DateTime  @default(now())
-  candidate     Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  id              String    @id @default(cuid())
+  candidateId     String    @unique
+  cvScore         Float
+  videoScore      Float
+  finalScore      Float
+  rank            Int? // 1 = best (AI-informed, deterministic computation)
+  justification   String? // AI "Why" narrative — advisory, never a decision
+  improvementJson String? // [{criterion, score, tip}] — candidate growth plan
+  decision        String? // CEO final call: ADVANCE | HOLD | REJECT
+  decisionNote    String? // CEO rationale for the decision
+  decidedByName   String?
+  decidedAt       DateTime?
+  flagsJson       String? // mandatory-criterion breaches etc.
+  computedAt      DateTime  @default(now())
+  candidate       Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
 }
 
 // ─────────────────────────────────────────────────────────────

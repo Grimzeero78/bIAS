@@ -67,6 +67,20 @@ export interface Breach {
   minThreshold: number;
 }
 
+export interface Improvement {
+  criterion: string;
+  score: number;
+  tip: string;
+}
+
+export interface ImprovementPlan {
+  candidateId: string;
+  focus: Improvement[];
+  summary: string;
+}
+
+export type Decision = "ADVANCE" | "HOLD" | "REJECT";
+
 export interface CandidateRow {
   id: string;
   fullName: string;
@@ -99,7 +113,13 @@ export interface CandidateRow {
     videoScore: number;
     finalScore: number;
     rank?: number | null;
+    rankedTotal?: number | null;
     justification?: string | null;
+    improvement?: ImprovementPlan | null;
+    decision?: Decision | null;
+    decisionNote?: string | null;
+    decidedByName?: string | null;
+    decidedAt?: string | null;
     flags: { breaches: Breach[] };
     computedAt: string;
   } | null;

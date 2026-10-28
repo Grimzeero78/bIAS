@@ -1,174 +1,233 @@
 "use client";
 
-import { useState } from "react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Badge } from "@/components/ui/badge";
-import { Scale, ShieldCheck, Video, FileText, Trophy, Eye, Loader2, Sparkles } from "lucide-react";
-import { apiSend } from "@/lib/api-client";
+import { useEffect, useState } from "react";
+import { KeyRound, Loader2, ShieldCheck, Scale, FileSearch, Video, ArrowRight, Quote } from "lucide-react";
+import { apiGet, apiSend } from "@/lib/api-client";
 import type { SessionUser } from "@/lib/types";
+import { Logo, MeritMark } from "@/components/app/brand";
 
-interface Props {
-  onAuthenticated: (user: SessionUser) => void;
+interface Hints {
+  admin: string;
+  interviewer: string;
 }
 
-export default function LoginView({ onAuthenticated }: Props) {
-  const [email, setEmail] = useState("");
+const PILLARS = [
+  {
+    icon: FileSearch,
+    title: "Evidence over impressions",
+    body: "Every CV and every second of the interview video is analysed into criterion scores with cited evidence — nothing rests on a gut feeling.",
+  },
+  {
+    icon: Scale,
+    title: "One formula, applied to all",
+    body: "Ranks are computed in code from weights the panel sets in advance. Identical rules for every candidate — no favourites, no shortcuts.",
+  },
+  {
+    icon: Video,
+    title: "Nothing to hide",
+    body: "Candidates see their own full report with timestamps; the CEO sees the complete board and the reasoning behind every position.",
+  },
+];
+
+export default function LoginView({ onAuthenticated }: { onAuthenticated: (u: SessionUser) => void }) {
+  const [tab, setTab] = useState<"staff" | "candidate">("staff");
   const [password, setPassword] = useState("");
-  const [cEmail, setCEmail] = useState("");
-  const [cCode, setCCode] = useState("");
+  const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [hints, setHints] = useState<Hints>({ admin: "Starts with “CEO-”", interviewer: "Starts with “PANEL-”" });
 
-  async function staffLogin() {
+  useEffect(() => {
+    apiGet<{ hints: Hints }>("/api/auth/hints").then((r) => setHints(r.hints)).catch(() => {});
+  }, []);
+
+  async function submitStaff(e?: React.FormEvent) {
+    e?.preventDefault();
+    if (!password || busy) return;
     setBusy(true);
     setError(null);
     try {
-      const res = await apiSend<{ user: SessionUser }>("/api/auth/login", "POST", { email, password });
+      const res = await apiSend<{ user: SessionUser }>("/api/auth/login", "POST", { password });
       onAuthenticated(res.user);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Login failed");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Login failed");
     } finally {
       setBusy(false);
     }
   }
 
-  async function candidateLogin() {
+  async function submitCandidate(e?: React.FormEvent) {
+    e?.preventDefault();
+    if (!code || busy) return;
     setBusy(true);
     setError(null);
     try {
-      const res = await apiSend<{ user: SessionUser }>("/api/auth/candidate", "POST", { email: cEmail, accessCode: cCode });
+      const res = await apiSend<{ user: SessionUser }>("/api/auth/candidate", "POST", { accessCode: code });
       onAuthenticated(res.user);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Login failed");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Login failed");
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-50 to-emerald-50/40 flex flex-col">
-      <header className="border-b bg-white/70 backdrop-blur">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <div className="h-9 w-9 rounded-xl bg-emerald-600 text-white flex items-center justify-center shadow-sm">
-              <Scale className="h-5 w-5" />
-            </div>
-            <div>
-              <div className="font-bold tracking-tight text-lg leading-none">RecruitAI</div>
-              <div className="text-[11px] text-slate-500 leading-none mt-0.5">Objective Hiring Intelligence</div>
-            </div>
-          </div>
-          <Badge variant="outline" className="gap-1.5 border-emerald-200 text-emerald-700 bg-emerald-50">
-            <ShieldCheck className="h-3.5 w-3.5" /> Corruption-free by design
-          </Badge>
-        </div>
-      </header>
+    <div className="relative min-h-screen overflow-hidden">
+      {/* ambient glows */}
+      <div aria-hidden className="pointer-events-none absolute inset-0">
+        <div className="absolute -top-40 left-1/2 h-[560px] w-[860px] -translate-x-1/2 rounded-full bg-emerald-500/[0.07] blur-[130px]" />
+        <div className="absolute bottom-0 right-0 h-[420px] w-[520px] rounded-full bg-gold/[0.05] blur-[120px]" />
+      </div>
 
-      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-10 lg:py-16 grid lg:grid-cols-2 gap-10 items-start">
-        {/* Pitch */}
-        <section className="space-y-6">
-          <div className="space-y-3">
-            <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-slate-900">
-              Every hire. <span className="text-emerald-600">Evidence-backed.</span>
-            </h1>
-            <p className="text-slate-600 text-base sm:text-lg leading-relaxed">
-              RecruitAI scores candidates on what actually matters — their CV substance and their
-              recorded interview performance — then ranks them and shows the receipts. No gut feeling,
-              no backdoor deals: every score carries its evidence trail.
-            </p>
+      <div className="relative mx-auto grid min-h-screen w-full max-w-7xl grid-cols-1 items-center gap-10 px-5 py-10 sm:px-8 lg:grid-cols-[1.15fr_0.85fr] lg:gap-16">
+        {/* ── brand story ── */}
+        <div className="anim-rise order-2 lg:order-1">
+          <div className="flex items-center gap-3">
+            <MeritMark size={46} className="anim-float" />
+            <div>
+              <p className="font-display text-xl font-bold tracking-tight">
+                True<span className="text-gradient-gold">Merit</span>
+              </p>
+              <p className="text-[11px] uppercase tracking-[0.28em] text-slate-500">Hiring intelligence</p>
+            </div>
           </div>
-          <div className="grid sm:grid-cols-2 gap-3">
-            {[
-              { icon: FileText, title: "AI CV parsing", text: "Skills, education and experience extracted and scored against the role." },
-              { icon: Video, title: "Video analysis", text: "Body language, dressing, English proficiency and sentiment — with timestamps." },
-              { icon: Trophy, title: "Transparent ranking", text: "Weighted scoring ranks candidates 1-N with a written justification." },
-              { icon: Eye, title: "Full audit trail", text: "Every upload, view and evaluation is logged for the CEO's review." },
-            ].map((f) => (
-              <div key={f.title} className="rounded-xl border bg-white p-4 shadow-sm">
-                <f.icon className="h-5 w-5 text-emerald-600 mb-2" />
-                <div className="font-semibold text-sm text-slate-900">{f.title}</div>
-                <div className="text-xs text-slate-500 mt-1 leading-relaxed">{f.text}</div>
+
+          <h1 className="mt-8 font-display text-[34px] font-bold leading-[1.08] tracking-tight text-slate-50 sm:text-5xl">
+            Merit decides.
+            <br />
+            <span className="text-gradient-emerald">Not connections.</span>
+          </h1>
+          <p className="mt-4 max-w-xl text-[15px] leading-relaxed text-slate-400">
+            TrueMerit removes favouritism from recruitment. Every application is scored against the
+            same published criteria, every rank is computed by a fixed formula, and every candidate
+            can see exactly why they landed where they did.
+          </p>
+
+          <div className="mt-8 grid gap-3.5 sm:grid-cols-3">
+            {PILLARS.map((p, i) => (
+              <div
+                key={p.title}
+                className="glass rounded-2xl p-4 anim-fade-up"
+                style={{ animationDelay: `${140 + i * 90}ms` }}
+              >
+                <p.icon className="h-5 w-5 text-emerald-300" />
+                <p className="mt-2.5 font-display text-[13px] font-semibold text-slate-100">{p.title}</p>
+                <p className="mt-1 text-[12px] leading-relaxed text-slate-500">{p.body}</p>
               </div>
             ))}
           </div>
-          <div className="rounded-xl border border-emerald-200 bg-emerald-50/60 p-4 text-xs text-slate-600 leading-relaxed">
-            <div className="flex items-center gap-1.5 font-semibold text-emerald-800 mb-1.5">
-              <Sparkles className="h-3.5 w-3.5" /> Demo accounts
-            </div>
-            CEO / Admin — <code className="bg-white px-1 py-0.5 rounded border">admin@recruit.ai / admin123</code>
-            <br />
-            Interviewer — <code className="bg-white px-1 py-0.5 rounded border">interviewer@recruit.ai / interview123</code>
-            <br />
-            Candidates sign in below with their email + personal access code.
+
+          <div className="mt-8 flex items-start gap-3 rounded-2xl border border-gold/25 bg-gold/[0.05] p-4">
+            <Quote className="mt-0.5 h-4 w-4 shrink-0 text-gold" />
+            <p className="text-[13px] leading-relaxed text-slate-300">
+              <span className="font-display font-semibold text-gold-soft">The AI is the assistant — never the judge.</span>{" "}
+              It reads documents, watches footage and writes explanations. The ranking formula and the
+              final hiring decision belong to people, and every step is stamped into an audit trail the CEO can inspect.
+            </p>
           </div>
-        </section>
-
-        {/* Login card */}
-        <section>
-          <Card className="shadow-lg border-slate-200">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-xl">Sign in</CardTitle>
-              <CardDescription>Choose your portal.</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <Tabs defaultValue="staff">
-                <TabsList className="grid w-full grid-cols-2 mb-4">
-                  <TabsTrigger value="staff">Staff</TabsTrigger>
-                  <TabsTrigger value="candidate">Candidate</TabsTrigger>
-                </TabsList>
-
-                <TabsContent value="staff" className="space-y-3.5">
-                  <div className="space-y-1.5">
-                    <Label htmlFor="email">Work email</Label>
-                    <Input id="email" type="email" placeholder="you@company.com" value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={(e) => e.key === "Enter" && staffLogin()} />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label htmlFor="password">Password</Label>
-                    <Input id="password" type="password" placeholder="••••••••" value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => e.key === "Enter" && staffLogin()} />
-                  </div>
-                  <Button className="w-full bg-emerald-600 hover:bg-emerald-700" onClick={staffLogin} disabled={busy}>
-                    {busy ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                    Sign in as staff
-                  </Button>
-                </TabsContent>
-
-                <TabsContent value="candidate" className="space-y-3.5">
-                  <div className="space-y-1.5">
-                    <Label htmlFor="cemail">Application email</Label>
-                    <Input id="cemail" type="email" placeholder="you@example.com" value={cEmail} onChange={(e) => setCEmail(e.target.value)} />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label htmlFor="ccode">Access code</Label>
-                    <Input id="ccode" placeholder="e.g. K7RM2QPX" value={cCode} onChange={(e) => setCCode(e.target.value.toUpperCase())} onKeyDown={(e) => e.key === "Enter" && candidateLogin()} />
-                  </div>
-                  <p className="text-xs text-slate-500">
-                    Your access code was issued when the interviewer registered your application. Score visibility depends on the employer&apos;s policy for the role.
-                  </p>
-                  <Button className="w-full bg-emerald-600 hover:bg-emerald-700" onClick={candidateLogin} disabled={busy}>
-                    {busy ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                    View my results
-                  </Button>
-                </TabsContent>
-              </Tabs>
-
-              {error && (
-                <div className="mt-4 rounded-lg border border-rose-200 bg-rose-50 text-rose-700 text-sm px-3 py-2.5">{error}</div>
-              )}
-            </CardContent>
-          </Card>
-        </section>
-      </main>
-
-      <footer className="border-t bg-white/70 py-4 mt-auto">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 text-xs text-slate-400 flex flex-wrap gap-x-6 gap-y-1 justify-between">
-          <span>RecruitAI — AI-assisted, evidence-backed recruitment</span>
-          <span>Scores are computed deterministically; AI writes explanations, not verdicts.</span>
         </div>
-      </footer>
+
+        {/* ── access card ── */}
+        <div className="anim-rise order-1 lg:order-2" style={{ animationDelay: "80ms" }}>
+          <div className="glass-deep mx-auto w-full max-w-md rounded-3xl p-6 sm:p-7">
+            <div className="grid grid-cols-2 gap-1.5 rounded-xl border border-white/8 bg-black/30 p-1.5">
+              {(
+                [
+                  { id: "staff", label: "Staff / CEO", icon: ShieldCheck },
+                  { id: "candidate", label: "My results", icon: KeyRound },
+                ] as const
+              ).map((t) => (
+                <button
+                  key={t.id}
+                  onClick={() => {
+                    setTab(t.id);
+                    setError(null);
+                  }}
+                  className={`flex items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-[13px] font-medium transition-all ${
+                    tab === t.id
+                      ? "bg-emerald-500/15 text-emerald-200 shadow-[inset_0_0_0_1px_rgba(16,185,129,0.35)]"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <t.icon className="h-4 w-4" />
+                  {t.label}
+                </button>
+              ))}
+            </div>
+
+            {tab === "staff" ? (
+              <form onSubmit={submitStaff} className="anim-fade-in mt-6 space-y-4">
+                <div>
+                  <h2 className="font-display text-lg font-semibold tracking-tight">Staff access</h2>
+                  <p className="mt-1 text-[13px] text-slate-500">
+                    One password per role — no emails. The CEO password opens the executive board; the panel password runs interviews.
+                  </p>
+                </div>
+                <label className="block">
+                  <span className="mb-1.5 block text-[12px] font-medium uppercase tracking-wider text-slate-500">Password</span>
+                  <input
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Enter your access password"
+                    autoComplete="current-password"
+                    className="w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3 text-[15px] text-slate-100 placeholder:text-slate-600 focus:border-emerald-400/50 focus:outline-none focus:ring-2 focus:ring-emerald-400/20"
+                  />
+                </label>
+                <div className="space-y-1.5 rounded-xl border border-white/6 bg-white/[0.03] p-3 text-[12px] text-slate-400">
+                  <p className="flex items-center gap-2"><span className="h-1.5 w-1.5 rounded-full bg-gold" /> CEO — hint: {hints.admin}</p>
+                  <p className="flex items-center gap-2"><span className="h-1.5 w-1.5 rounded-full bg-emerald-400" /> Interview panel — hint: {hints.interviewer}</p>
+                </div>
+                {error && <p className="rounded-lg border border-rose-400/25 bg-rose-400/10 px-3 py-2 text-[13px] text-rose-300">{error}</p>}
+                <button
+                  type="submit"
+                  disabled={busy || !password}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-emerald-400 px-4 py-3 font-display text-[15px] font-semibold text-emerald-950 transition-all hover:brightness-110 disabled:opacity-40 glow-emerald"
+                >
+                  {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+                  {busy ? "Verifying…" : "Enter the boardroom"}
+                </button>
+              </form>
+            ) : (
+              <form onSubmit={submitCandidate} className="anim-fade-in mt-6 space-y-4">
+                <div>
+                  <h2 className="font-display text-lg font-semibold tracking-tight">Check your results</h2>
+                  <p className="mt-1 text-[13px] text-slate-500">
+                    Enter the personal code your interviewer gave you to see your full interview report — your scores, the evidence, and what to improve.
+                  </p>
+                </div>
+                <label className="block">
+                  <span className="mb-1.5 block text-[12px] font-medium uppercase tracking-wider text-slate-500">Interview access code</span>
+                  <input
+                    value={code}
+                    onChange={(e) => setCode(e.target.value.toUpperCase())}
+                    placeholder="E.g. 7KQM2XRD"
+                    autoComplete="off"
+                    maxLength={16}
+                    className="code-input w-full rounded-xl border border-white/10 bg-black/40 px-4 py-3.5 text-center text-[17px] font-semibold text-gold-soft placeholder:text-slate-600 focus:border-gold/50 focus:outline-none focus:ring-2 focus:ring-gold/20"
+                  />
+                </label>
+                {error && <p className="rounded-lg border border-rose-400/25 bg-rose-400/10 px-3 py-2 text-[13px] text-rose-300">{error}</p>}
+                <button
+                  type="submit"
+                  disabled={busy || !code}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-gold to-gold-soft px-4 py-3 font-display text-[15px] font-semibold text-[#241a02] transition-all hover:brightness-110 disabled:opacity-40 glow-gold"
+                >
+                  {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
+                  {busy ? "Opening…" : "Open my report"}
+                </button>
+                <p className="text-center text-[12px] text-slate-600">
+                  Lost your code? Ask your interviewer — codes are issued per application.
+                </p>
+              </form>
+            )}
+          </div>
+
+          <p className="mt-4 text-center text-[11px] text-slate-600">
+            Deterministic scoring · Append-only audit trail · Candidate transparency by default
+          </p>
+        </div>
+      </div>
     </div>
   );
 }

@@ -10,7 +10,7 @@ export async function audit(
   actor: SessionUser | null,
   action: string,
   entityType: string,
-  entityId?: string,
+  entityId?: string | null,
   details?: unknown
 ) {
   try {

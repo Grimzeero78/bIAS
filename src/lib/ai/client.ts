@@ -1,4 +1,5 @@
 import ZAI from "z-ai-web-dev-sdk";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
 
 /**
  * Shared backend AI client.
@@ -13,9 +14,60 @@ import ZAI from "z-ai-web-dev-sdk";
 
 let _zai: ZAI | null = null;
 
+/**
+ * Client resolution order:
+ *  1. ZAI_BASE_URL + ZAI_API_KEY env vars — used on serverless/edge hosts
+ *     (e.g. Cloudflare Workers) where no config file can be read.
+ *  2. The SDK default — reads .z-ai-config from the project/home dir (sandbox,
+ *     full-server deployments).
+ */
+async function zaiCredentials(): Promise<Record<string, string> | null> {
+  // Full-config secret (recommended for deployments): JSON with baseUrl, apiKey,
+  // and any of chatId/token/userId the service requires.
+  const rawJson = process.env.ZAI_CONFIG_JSON;
+  if (rawJson) {
+    try {
+      const cfg = JSON.parse(rawJson) as Record<string, string>;
+      if (cfg.baseUrl && cfg.apiKey) return cfg;
+    } catch {
+      console.error("[ai] ZAI_CONFIG_JSON is not valid JSON");
+    }
+  }
+  const base = process.env.ZAI_BASE_URL;
+  const key = process.env.ZAI_API_KEY;
+  if (base && key) return { baseUrl: base, apiKey: key };
+  // On Workers, env vars live in bindings — OpenNext doesn't always mirror
+  // them onto process.env, so check the request context too.
+  try {
+    const env = getCloudflareContext().env as Record<string, string | undefined> | undefined;
+    if (env?.ZAI_CONFIG_JSON) {
+      try {
+        const cfg = JSON.parse(env.ZAI_CONFIG_JSON) as Record<string, string>;
+        if (cfg.baseUrl && cfg.apiKey) return cfg;
+      } catch {}
+    } else if (env?.ZAI_BASE_URL && env?.ZAI_API_KEY) {
+      return { baseUrl: env.ZAI_BASE_URL, apiKey: env.ZAI_API_KEY };
+    }
+  } catch {
+    /* not on Cloudflare */
+  }
+  return null;
+}
+
 export async function getZAI(): Promise<ZAI> {
-  if (!_zai) _zai = await ZAI.create();
-  return _zai;
+  if (_zai) return _zai;
+  const cfg = await zaiCredentials();
+  let client: ZAI;
+  if (cfg) {
+    // The SDK's types mark the constructor private, but it is the documented
+    // way to pass config programmatically (needed where no config file exists).
+    const ZAIWithCtor = ZAI as unknown as new (config: Record<string, string>) => ZAI;
+    client = new ZAIWithCtor(cfg);
+  } else {
+    client = await ZAI.create();
+  }
+  _zai = client;
+  return client;
 }
 
 export async function llmText(system: string, user: string, retries = 2): Promise<string> {

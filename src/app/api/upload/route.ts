@@ -71,7 +71,7 @@ export async function POST(req: NextRequest) {
         create: { candidateId, status: "PENDING" },
         update: {
           status: "PENDING", error: null, progress: "Queued", overallScore: null, scoresJson: null,
-          observationsJson: null, transcript: null, segmentsJson: null, framesJson: null,
+          observationsJson: null, transcript: null, segmentsJson: null, framesJson: null, precomputedKey: null,
         },
       });
     }

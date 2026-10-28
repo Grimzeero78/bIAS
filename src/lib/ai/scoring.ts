@@ -124,6 +124,7 @@ export async function rankAndJustify(jobId: string): Promise<{ evaluated: number
   }));
 
   let justifications: { candidateId: string; text: string }[] = [];
+  let improvements: { candidateId: string; focus: { criterion: string; score: number; tip: string }[]; summary: string }[] = [];
   if (sorted.length > 0) {
     try {
       const res = await llmJson<{ justifications: { candidateId: string; text: string }[] }>(
@@ -141,6 +142,40 @@ ${JSON.stringify(brief).slice(0, 60000)}`
     } catch (e) {
       console.error("[evaluate] justification LLM failed, falling back to deterministic text:", e);
     }
+
+    // Candidate growth plan — transparency: every applicant learns exactly what
+    // to improve next time. Advisory only; never affects scores or ranks.
+    try {
+      const res = await llmJson<{
+        improvements: { candidateId: string; focus: { criterion: string; score: number; tip: string }[]; summary: string }[];
+      }>(
+        `You are a career coach writing private, constructive feedback for job applicants after an AI-assisted interview evaluation.
+For EVERY candidate pick their 2-4 WEAKEST criteria (score < 65, or the lowest scores available) and for each give ONE concrete, actionable improvement tip (1-2 sentences, practical, respectful, no jargon). Also write a 1-2 sentence encouraging summary acknowledging what they did well.
+Return JSON {"improvements":[{"candidateId":"...","focus":[{"criterion":"...","score":number,"tip":"..."}],"summary":"..."}]} with one entry for every candidate.`,
+        `JOB: ${job.title} — ${job.department || "General"}
+
+COMPUTED RESULTS:
+${JSON.stringify(brief).slice(0, 60000)}`
+      );
+      improvements = res.improvements || [];
+    } catch (e) {
+      console.error("[evaluate] improvement-plan LLM failed, using deterministic fallback:", e);
+    }
+  }
+
+  // deterministic fallback when the AI is unavailable — still useful, still honest
+  function fallbackImprovement(c: ComputedEvaluation) {
+    const all = [...c.cvScores, ...c.videoScores].sort((a, b) => a.score - b.score);
+    const focus = all.filter((s) => s.score < 65).slice(0, 3).map((s) => ({
+      criterion: s.name,
+      score: s.score,
+      tip: `This was your lowest-scoring area (${s.score}/100). Review it before your next interview and prepare concrete examples that demonstrate it.`,
+    }));
+    const best = all.length ? all[all.length - 1] : null;
+    const summary = best
+      ? `Your strongest area was ${best.name} (${best.score}/100). Focus the next attempt on the areas listed below.`
+      : "Complete feedback will be available once all analysis finishes.";
+    return { candidateId: c.candidateId, focus, summary };
   }
 
   // persist evaluations
@@ -153,6 +188,8 @@ ${JSON.stringify(brief).slice(0, 60000)}`
       justifications.find((j) => j.text && c.fullName && j.text.startsWith(c.fullName))?.text;
     const text = aiText && aiText.length > 40 ? `${aiText}\n\n[Computed] ${auto}` : auto;
 
+    const improvement = improvements.find((i) => i.candidateId === c.candidateId) ?? fallbackImprovement(c);
+
     await db.evaluation.upsert({
       where: { candidateId: c.candidateId },
       create: {
@@ -162,6 +199,7 @@ ${JSON.stringify(brief).slice(0, 60000)}`
         finalScore: c.finalScore,
         rank,
         justification: text,
+        improvementJson: JSON.stringify(improvement),
         flagsJson: c.flagsJson,
       },
       update: {
@@ -170,6 +208,7 @@ ${JSON.stringify(brief).slice(0, 60000)}`
         finalScore: c.finalScore,
         rank,
         justification: text,
+        improvementJson: JSON.stringify(improvement),
         flagsJson: c.flagsJson,
         computedAt: new Date(),
       },

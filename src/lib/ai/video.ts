@@ -4,10 +4,32 @@ import { readFile, readdir, rm, mkdir } from "fs/promises";
 import path from "path";
 import { llmJson } from "./client";
 import { getZAI, extractJson } from "./client";
+import type { VisionMultimodalContentItem } from "z-ai-web-dev-sdk";
 import { clampScore, weightedMean, type CriterionScore } from "./cv";
 import { db } from "@/lib/db";
+import { getObject } from "@/lib/storage";
 
 const exec = promisify(execFile);
+
+/** Browser-prepared manifest shape (see src/lib/media-client.ts). */
+interface PrecomputedManifest {
+  version: number;
+  durationSec: number;
+  frames: { t: number; dataUrl: string }[];
+  audio: { startSec: number; wavBase64: string }[];
+}
+
+async function loadPrecomputed(key: string | null | undefined): Promise<PrecomputedManifest | null> {
+  if (!key) return null;
+  try {
+    const buf = await getObject(key);
+    const parsed = JSON.parse(buf.toString("utf-8")) as PrecomputedManifest;
+    if (parsed && (parsed.frames?.length || parsed.audio?.length)) return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * VIDEO INTERVIEW ANALYSIS PIPELINE
@@ -116,6 +138,21 @@ async function transcribeChunks(chunks: { file: string; start: number }[]): Prom
   return segments;
 }
 
+async function transcribeBase64Chunks(chunks: { startSec: number; wavBase64: string }[]): Promise<{ start: number; end: number; text: string }[]> {
+  const zai = await getZAI();
+  const segments: { start: number; end: number; text: string }[] = [];
+  for (const c of chunks) {
+    try {
+      const res = await zai.audio.asr.create({ file_base64: c.wavBase64 });
+      const text = (res?.text || "").trim();
+      if (text) segments.push({ start: c.startSec, end: c.startSec + CHUNK_SEC, text });
+    } catch (e) {
+      console.error(`[video] ASR chunk @${c.startSec}s failed:`, e instanceof Error ? e.message : e);
+    }
+  }
+  return segments;
+}
+
 const VISUAL_SYSTEM = `You are a professional interview body-language analyst. You receive a sequence of frames from a recorded video interview, each labelled with its timestamp in seconds.
 Analyse ONLY what is visually observable. Return JSON:
 {"person_present": boolean,
@@ -131,20 +168,23 @@ async function visionPass(frames: Frame[]): Promise<unknown> {
   if (!frames.length) throw new Error("No frames could be extracted from the video");
   const frameLabels = frames.map((f, i) => `Frame ${i + 1} = t=${f.t}s`).join("; ");
   const zai = await getZAI();
-  const content: Record<string, unknown>[] = [
+  const content: VisionMultimodalContentItem[] = [
     {
       type: "text",
       text: `These are ${frames.length} sequential frames from a recorded job interview video.\n${frameLabels}\n\n${VISUAL_SYSTEM}`,
     },
-    ...frames.map((f) => ({ type: "image_url", image_url: { url: f.dataUrl } })),
+    ...frames.map((f) => ({ type: "image_url" as const, image_url: { url: f.dataUrl } })),
   ];
   let lastErr: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const res = await zai.chat.completions.createVision({
+      // SDK's type marks `model` required, but the service accepts the default
+      // when omitted — cast keeps runtime payload identical to the working contract.
+      const body = {
         messages: [{ role: "user", content }],
         thinking: { type: "disabled" },
-      });
+      } as unknown as Parameters<typeof zai.chat.completions.createVision>[0];
+      const res = await zai.chat.completions.createVision(body);
       const raw = res.choices[0]?.message?.content || "";
       const parsed = extractJson<unknown>(raw);
       if (parsed) return parsed;
@@ -183,53 +223,96 @@ export async function analyzeVideo(candidateId: string): Promise<void> {
   });
   if (!doc) throw new Error("No interview video uploaded");
 
+  const pre = await loadPrecomputed(analysis.precomputedKey);
   const work = path.join(WORK_ROOT, candidateId);
   try {
-    await db.videoAnalysis.update({ where: { candidateId }, data: { status: "PROCESSING", progress: "Inspecting video file", error: null } });
-    const src = srcPath(doc.storedPath);
-    const { duration, hasAudio } = await ffprobeDuration(src);
-    await db.videoAnalysis.update({ where: { candidateId }, data: { durationSec: duration || null, progress: "Extracting interview frames" } });
+    if (pre) {
+      await db.videoAnalysis.update({ where: { candidateId }, data: { status: "PROCESSING", progress: "Using browser-prepared evidence", error: null } });
+      await runAnalysisFromManifest(candidateId, pre);
+    } else {
+      await db.videoAnalysis.update({ where: { candidateId }, data: { status: "PROCESSING", progress: "Inspecting video file", error: null } });
+      await runAnalysisWithFfmpeg(candidateId, doc.storedPath, work);
+    }
+  } finally {
+    await rm(work, { recursive: true, force: true }).catch(() => {});
+  }
+}
 
-    const frames = await extractFrames(src, work, duration);
+/** Edge-friendly path: consume frames + audio prepared by the browser. */
+async function runAnalysisFromManifest(candidateId: string, pre: PrecomputedManifest): Promise<void> {
+  await db.videoAnalysis.update({
+    where: { candidateId },
+    data: {
+      durationSec: pre.durationSec || null,
+      framesJson: JSON.stringify(pre.frames.map((f) => ({ t: f.t }))),
+      progress: "AI visual analysis of frames",
+    },
+  });
+
+  const frames: Frame[] = pre.frames.map((f) => ({ t: f.t, file: "(browser)", dataUrl: f.dataUrl }));
+  const visual = await visionPass(frames);
+
+  await db.videoAnalysis.update({ where: { candidateId }, data: { progress: "Transcribing speech (ASR)" } });
+  const segments = pre.audio.length ? await transcribeBase64Chunks(pre.audio) : [];
+  await finishVideoAnalysis(candidateId, visual, segments);
+}
+
+/** Full-server path (sandbox / API clients): ffmpeg frames + audio then ASR. */
+async function runAnalysisWithFfmpeg(candidateId: string, storedPath: string, work: string): Promise<void> {
+  await mkdir(work, { recursive: true });
+  const src = srcPath(storedPath);
+  const { duration, hasAudio } = await ffprobeDuration(src);
+  await db.videoAnalysis.update({ where: { candidateId }, data: { durationSec: duration || null, progress: "Extracting interview frames" } });
+
+  const frames = await extractFrames(src, work, duration);
+  await db.videoAnalysis.update({
+    where: { candidateId },
+    data: { framesJson: JSON.stringify(frames.map((f) => ({ t: f.t }))), progress: "AI visual analysis of frames" },
+  });
+
+  const visual = await visionPass(frames);
+
+  await db.videoAnalysis.update({ where: { candidateId }, data: { progress: "Transcribing speech (ASR)" } });
+  const chunks = await extractAudioChunks(src, work, hasAudio);
+  const segments = await transcribeChunks(chunks);
+  await finishVideoAnalysis(candidateId, visual, segments, chunks.length > 0);
+}
+
+async function finishVideoAnalysis(
+  candidateId: string,
+  visual: unknown,
+  segments: { start: number; end: number; text: string }[],
+  hadAudioChunks = true
+): Promise<void> {
+  if (segments.length > 0 || hadAudioChunks) {
     await db.videoAnalysis.update({
       where: { candidateId },
-      data: { framesJson: JSON.stringify(frames.map((f) => ({ t: f.t }))), progress: "AI visual analysis of frames" },
+      data: {
+        transcript: segments.map((s) => `[${fmtT(s.start)}] ${s.text}`).join("\n").slice(0, 50000),
+        segmentsJson: JSON.stringify(segments),
+        progress: "Fusing evidence into criterion scores",
+      },
     });
+  } else {
+    await db.videoAnalysis.update({ where: { candidateId }, data: { progress: "Fusing evidence into criterion scores" } });
+  }
 
-    const visual = await visionPass(frames);
+  const candidate = await db.candidate.findUniqueOrThrow({
+    where: { id: candidateId },
+    include: { job: { include: { criteria: true } } },
+  });
+  const videoCriteria = candidate.job.criteria.filter((c) => c.category === "VIDEO");
 
-    await db.videoAnalysis.update({ where: { candidateId }, data: { progress: "Transcribing speech (ASR)" } });
-    const chunks = await extractAudioChunks(src, work, hasAudio);
-    const segments = await transcribeChunks(chunks);
-    if (chunks.length > 0) {
-      await db.videoAnalysis.update({
-        where: { candidateId },
-        data: {
-          transcript: segments.map((s) => `[${fmtT(s.start)}] ${s.text}`).join("\n").slice(0, 50000),
-          segmentsJson: JSON.stringify(segments),
-          progress: "Fusing evidence into criterion scores",
-        },
-      });
-    } else {
-      await db.videoAnalysis.update({ where: { candidateId }, data: { progress: "Fusing evidence into criterion scores" } });
-    }
+  const rubric = videoCriteria.map((c, i) => `${i + 1}. id=${c.id} | ${c.name} (weight ${c.weight}) — ${c.description}`).join("\n");
+  const transcript = segments.map((s) => `[${s.start}s-${s.end}s] ${s.text}`).join("\n").slice(0, 24000);
 
-    const candidate = await db.candidate.findUniqueOrThrow({
-      where: { id: candidateId },
-      include: { job: { include: { criteria: true } } },
-    });
-    const videoCriteria = candidate.job.criteria.filter((c) => c.category === "VIDEO");
-
-    const rubric = videoCriteria.map((c, i) => `${i + 1}. id=${c.id} | ${c.name} (weight ${c.weight}) — ${c.description}`).join("\n");
-    const transcript = segments.map((s) => `[${s.start}s-${s.end}s] ${s.text}`).join("\n").slice(0, 24000);
-
-    const fusion = await llmJson<{
-      scores: { criterionId: string; score: number; rationale: string }[];
-      observations: { t: number; category: string; observation: string; quote?: string }[];
-      overall_impression: string;
-    }>(
-      FUSION_SYSTEM,
-      `JOB: ${candidate.job.title}
+  const fusion = await llmJson<{
+    scores: { criterionId: string; score: number; rationale: string }[];
+    observations: { t: number; category: string; observation: string; quote?: string }[];
+    overall_impression: string;
+  }>(
+    FUSION_SYSTEM,
+    `JOB: ${candidate.job.title}
 CRITERIA:
 ${rubric}
 
@@ -240,52 +323,49 @@ TRANSCRIPT (empty means no usable audio):
 ${transcript || "(no transcript — audio missing or unintelligible)"}
 
 Return the JSON now.`
-    );
+  );
 
-    const scores: CriterionScore[] = (fusion.scores || []).map((s) => {
-      const crit = videoCriteria.find((c) => c.id === s.criterionId);
-      return {
-        criterionId: s.criterionId,
-        name: crit?.name ?? "Criterion",
-        score: clampScore(s.score),
-        rationale: String(s.rationale || "").slice(0, 800),
-      };
-    });
-    for (const c of videoCriteria) {
-      if (!scores.some((s) => s.criterionId === c.id)) {
-        scores.push({ criterionId: c.id, name: c.name, score: 0, rationale: "No score returned by AI for this criterion; treated as not evidenced." });
-      }
+  const scores: CriterionScore[] = (fusion.scores || []).map((s) => {
+    const crit = videoCriteria.find((c) => c.id === s.criterionId);
+    return {
+      criterionId: s.criterionId,
+      name: crit?.name ?? "Criterion",
+      score: clampScore(s.score),
+      rationale: String(s.rationale || "").slice(0, 800),
+    };
+  });
+  for (const c of videoCriteria) {
+    if (!scores.some((s) => s.criterionId === c.id)) {
+      scores.push({ criterionId: c.id, name: c.name, score: 0, rationale: "No score returned by AI for this criterion; treated as not evidenced." });
     }
-
-    const observations = (fusion.observations || [])
-      .filter((o) => o && typeof o.observation === "string")
-      .map((o) => ({
-        t: Math.max(0, Math.round((Number(o.t) || 0) * 10) / 10),
-        category: String(o.category || "General").slice(0, 40),
-        observation: String(o.observation).slice(0, 400),
-        quote: o.quote ? String(o.quote).slice(0, 300) : undefined,
-      }))
-      .sort((a, b) => a.t - b.t)
-      .slice(0, 60);
-
-    const overall = weightedMean(
-      scores.map((s) => ({ score: s.score, weight: videoCriteria.find((c) => c.id === s.criterionId)?.weight ?? 1 }))
-    );
-
-    await db.videoAnalysis.update({
-      where: { candidateId },
-      data: {
-        status: "COMPLETED",
-        progress: null,
-        scoresJson: JSON.stringify(scores),
-        observationsJson: JSON.stringify(observations),
-        overallScore: overall,
-        processedAt: new Date(),
-      },
-    });
-  } finally {
-    await rm(work, { recursive: true, force: true }).catch(() => {});
   }
+
+  const observations = (fusion.observations || [])
+    .filter((o) => o && typeof o.observation === "string")
+    .map((o) => ({
+      t: Math.max(0, Math.round((Number(o.t) || 0) * 10) / 10),
+      category: String(o.category || "General").slice(0, 40),
+      observation: String(o.observation).slice(0, 400),
+      quote: o.quote ? String(o.quote).slice(0, 300) : undefined,
+    }))
+    .sort((a, b) => a.t - b.t)
+    .slice(0, 60);
+
+  const overall = weightedMean(
+    scores.map((s) => ({ score: s.score, weight: videoCriteria.find((c) => c.id === s.criterionId)?.weight ?? 1 }))
+  );
+
+  await db.videoAnalysis.update({
+    where: { candidateId },
+    data: {
+      status: "COMPLETED",
+      progress: null,
+      scoresJson: JSON.stringify(scores),
+      observationsJson: JSON.stringify(observations),
+      overallScore: overall,
+      processedAt: new Date(),
+    },
+  });
 }
 
 export function fmtT(sec: number): string {

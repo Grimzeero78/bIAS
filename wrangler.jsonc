@@ -1,0 +1,42 @@
+// Cloudflare Workers configuration for TrueMerit (via @opennextjs/cloudflare).
+//
+// One-time provisioning (see README → "Deploy to Cloudflare"):
+//   npx wrangler d1 create truemerit            → paste the id below
+//   npx wrangler r2 bucket create truemerit-files
+//   npx wrangler d1 migrations apply truemerit --remote
+//   npx wrangler secret put AUTH_SECRET         (+ CEO_PASSWORD / PANEL_PASSWORD
+//                                                ZAI_BASE_URL / ZAI_API_KEY)
+// Then:  bun run cf:deploy
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "truemerit",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "observability": {
+    "enabled": true
+  },
+  // ── bindings the app detects at runtime (src/lib/db.ts, src/lib/storage.ts) ──
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "truemerit",
+      "database_id": "REPLACE_WITH_YOUR_D1_ID"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "R2",
+      "bucket_name": "truemerit-files"
+    }
+  ],
+  "vars": {
+    // Access passwords default to CEO-MASTER-2026 / PANEL-ROOM-2026 —
+    // override with `wrangler secret put` for real deployments.
+    "NEXT_PUBLIC_APP_NAME": "TrueMerit"
+  }
+}

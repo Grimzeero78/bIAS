@@ -10,7 +10,15 @@
     "db:push": "prisma db push --accept-data-loss",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
-    "db:reset": "prisma migrate reset"
+    "db:reset": "prisma migrate reset",
+    "cf:build": "node scripts/make_cf_schema.mjs && prisma generate --schema prisma/schema.cf.prisma && opennextjs-cloudflare build",
+    "cf:deploy": "opennextjs-cloudflare deploy",
+    "cf:dev": "opennextjs-cloudflare dev",
+    "cf:migrate:local": "wrangler d1 migrations apply truemerit --local",
+    "cf:migrate:remote": "wrangler d1 migrations apply truemerit --remote",
+    "test": "bun test src-test",
+    "test:unit": "bun test src-test/unit",
+    "test:api": "bun test src-test/api"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -18,6 +26,7 @@
     "@dnd-kit/utilities": "^3.2.2",
     "@hookform/resolvers": "^5.1.1",
     "@mdxeditor/editor": "^3.39.1",
+    "@prisma/adapter-d1": "^7.10.1",
     "@prisma/client": "^6.11.1",
     "@radix-ui/react-accordion": "^1.2.11",
     "@radix-ui/react-alert-dialog": "^1.1.14",
@@ -83,6 +92,7 @@
     "zustand": "^5.0.6"
   },
   "devDependencies": {
+    "@opennextjs/cloudflare": "^1.20.13",
     "@tailwindcss/postcss": "^4",
     "@types/react": "^19",
     "@types/react-dom": "^19",
@@ -91,6 +101,7 @@
     "eslint-config-next": "^16.1.1",
     "tailwindcss": "^4",
     "tw-animate-css": "^1.3.5",
-    "typescript": "^5"
+    "typescript": "^5",
+    "wrangler": "^4.154.0"
   }
 }

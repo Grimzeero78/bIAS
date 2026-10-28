@@ -1,7 +1,7 @@
-import { readFile } from "fs/promises";
 import path from "path";
 import { llmJson, llmText, extractJson } from "./client";
 import { db } from "@/lib/db";
+import { getObject } from "@/lib/storage";
 
 /**
  * CV ANALYSIS PIPELINE
@@ -11,22 +11,76 @@ import { db } from "@/lib/db";
  * Overall score = weighted mean of criterion scores (0-100).
  */
 
-// pdf-parse v2 exposes a PDFParse class (pdfjs-dist based).
-import { PDFParse } from "pdf-parse";
+/** Minimal globals pdf.js touches at import in non-DOM runtimes (workerd). */
+function ensurePdfjsGlobals() {
+  const g = globalThis as Record<string, unknown>;
+  g.DOMMatrix ??= class {
+    a = 1;
+    b = 0;
+    c = 0;
+    d = 1;
+    e = 0;
+    f = 0;
+    constructor(_init?: unknown) {}
+    static fromString(): null {
+      return null;
+    }
+    static fromArray(): null {
+      return null;
+    }
+  } as unknown as undefined;
+  g.ImageData ??= class {
+    width = 0;
+    height = 0;
+    data = new Uint8ClampedArray(0);
+    constructor(_a?: unknown, _b?: unknown) {}
+  } as unknown as undefined;
+  g.Path2D ??= class {
+    constructor(_a?: unknown) {}
+  } as unknown as undefined;
+}
+
+/** PDF text extraction via pdf.js — pure JS, works on Node AND workerd. */
+async function extractPdfText(buf: Buffer): Promise<string> {
+  ensurePdfjsGlobals();
+  const pdfjs = (await import("pdfjs-dist/legacy/build/pdf.mjs")) as unknown as {
+    getDocument: (opts: Record<string, unknown>) => { promise: Promise<PdfDoc> };
+  };
+  const doc = await pdfjs.getDocument({
+    data: new Uint8Array(buf),
+    isEvalSupported: false,
+    useSystemFonts: false,
+    disableFontFace: true,
+    standardFontDataUrl: undefined,
+  }).promise;
+  try {
+    const parts: string[] = [];
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      parts.push(content.items.map((it) => ("str" in it ? it.str : "")).join(" "));
+      page.cleanup();
+    }
+    return parts.join("\n").trim();
+  } finally {
+    await doc.destroy();
+  }
+}
+
+interface PdfDoc {
+  numPages: number;
+  getPage: (n: number) => Promise<{
+    getTextContent: () => Promise<{ items: { str?: string }[] }>;
+    cleanup: () => void;
+  }>;
+  destroy: () => Promise<void>;
+}
 
 export async function extractCvText(filename: string, storedPath: string): Promise<string> {
-  const abs = path.join(process.cwd(), "storage", "uploads", storedPath);
-  const buf = await readFile(abs);
+  // Storage-abstracted read — works on local disk AND Cloudflare R2.
+  const buf = await getObject(storedPath);
   const ext = path.extname(filename).toLowerCase();
-  if (ext === ".pdf") {
-    const parser = new PDFParse({ data: new Uint8Array(buf) });
-    try {
-      const out = await parser.getText();
-      return (out.text || "").trim();
-    } finally {
-      await parser.destroy().catch(() => {});
-    }
-  }
+  if (ext === ".pdf") return extractPdfText(buf);
   if (ext === ".docx") {
     const mammoth = await import("mammoth");
     const out = await mammoth.extractRawText({ buffer: buf });

@@ -1,31 +1,37 @@
 import { db } from "@/lib/db";
-import { hashPassword } from "@/lib/auth";
+import { hashPassword, staffPassword } from "@/lib/auth";
 
 /**
- * Idempotent auto-seed so the platform is usable immediately:
- *  - CEO/Admin  : admin@recruit.ai  / admin123
- *  - Interviewer: interviewer@recruit.ai / interview123
+ * Idempotent auto-seed so the platform is usable immediately.
+ *
+ * Staff access uses exactly TWO shared passwords (no emails):
+ *   CEO password        → ADMIN   ("CEO Office"      actor in the audit trail)
+ *   Interview Panel pwd → INTERVIEWER ("Interview Panel" actor in the audit trail)
+ * Hashes are re-synced on boot so changing CEO_PASSWORD / PANEL_PASSWORD env
+ * vars (or the defaults) takes effect on next start.
+ *
  * A demo job opening with default analysis criteria is created on first boot.
  */
 export async function ensureSeed() {
-  const userCount = await db.user.count();
-  if (userCount === 0) {
-    await db.user.createMany({
-      data: [
-        {
-          email: "admin@recruit.ai",
-          name: "Amara Okafor (CEO)",
-          passwordHash: hashPassword("admin123"),
-          role: "ADMIN",
-        },
-        {
-          email: "interviewer@recruit.ai",
-          name: "Daniel Mwangi",
-          passwordHash: hashPassword("interview123"),
-          role: "INTERVIEWER",
-        },
-      ],
-    });
+  // ── staff accounts (password-only login) ──
+  const staffDefs = [
+    { role: "ADMIN", email: "ceo@truemerit.app", name: "CEO Office", password: staffPassword("ADMIN") },
+    { role: "INTERVIEWER", email: "panel@truemerit.app", name: "Interview Panel", password: staffPassword("INTERVIEWER") },
+  ] as const;
+
+  for (const def of staffDefs) {
+    const existing = await db.user.findFirst({ where: { role: def.role, active: true }, orderBy: { createdAt: "asc" } });
+    if (existing) {
+      const patch: Record<string, unknown> = { passwordHash: hashPassword(def.password), name: def.name, active: true };
+      if (existing.email.includes("@recruit.ai") || existing.email.includes("@truemerit.app")) {
+        patch.email = def.email; // migrate legacy sandbox emails
+      }
+      await db.user.update({ where: { id: existing.id }, data: patch });
+    } else {
+      await db.user.create({
+        data: { email: def.email, name: def.name, passwordHash: hashPassword(def.password), role: def.role },
+      });
+    }
   }
 
   const jobCount = await db.jobOpening.count();
@@ -45,6 +51,7 @@ export async function ensureSeed() {
           "Bachelor degree required. 2+ years experience in operations, data analysis or consulting. Strong Excel and reporting skills. Excellent written and spoken English. Professional presence.",
         cvWeight: 40,
         videoWeight: 60,
+        candidateVisibility: true,
         createdById: owner.id,
         createdByName: owner.name,
         criteria: {
@@ -111,5 +118,21 @@ export async function ensureSeed() {
         },
       },
     });
+  } else {
+    // One-time transparency backfill (marker-guarded so deliberate opt-outs made
+    // later by the CEO are never overwritten):
+    const backfilled = await db.auditLog.findFirst({ where: { action: "SEED_VISIBILITY_BACKFILL" } });
+    if (!backfilled) {
+      await db.jobOpening.updateMany({ where: { candidateVisibility: false }, data: { candidateVisibility: true } });
+      await db.auditLog.create({
+        data: {
+          actorName: "system",
+          actorRole: "SYSTEM",
+          action: "SEED_VISIBILITY_BACKFILL",
+          entityType: "JOB",
+          details: "One-time backfill: candidate result visibility enabled by default on all openings",
+        },
+      });
+    }
   }
 }

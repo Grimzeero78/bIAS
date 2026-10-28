@@ -51,4 +51,21 @@ prompt
 
 server.log
 # Skills directory
+/skills/.dev.vars
+.wrangler/
+.open-next/
+src/generated/
+
+# TrueMerit runtime data (databases, uploaded evidence, temp work)
+/db/
+/storage/
+/download/
+/scripts/e2e/*.png
+upload/
+.dev.vars
+.worklog
 /skills/
+/mini-services/
+/examples/
+/upload/
+.zscripts/

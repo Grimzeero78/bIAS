@@ -23,6 +23,31 @@ export interface SessionUser {
   candidateId?: string | null;
 }
 
+// ── staff access passwords ──────────────────────────────────
+/**
+ * The platform has exactly TWO staff passwords (no emails):
+ *   CEO password   → ADMIN role (full organisation view + final decisions)
+ *   Panel password → INTERVIEWER role (runs jobs they created)
+ * Both are env-overridable for real deployments. Login verifies the typed
+ * password against the (scrypt-hashed) staff accounts seeded from these.
+ */
+export const STAFF_PASSWORD_DEFAULTS = {
+  ADMIN: "CEO-MASTER-2026",
+  INTERVIEWER: "PANEL-ROOM-2026",
+} as const;
+
+export function staffPassword(role: Exclude<Role, "CANDIDATE">): string {
+  if (role === "ADMIN") return process.env.CEO_PASSWORD || STAFF_PASSWORD_DEFAULTS.ADMIN;
+  return process.env.PANEL_PASSWORD || STAFF_PASSWORD_DEFAULTS.INTERVIEWER;
+}
+
+/** Public hint shown on the login card (first segment only, never the full secret). */
+export function staffPasswordHint(role: Exclude<Role, "CANDIDATE">): string {
+  const pwd = staffPassword(role);
+  const stem = pwd.split("-")[0] || "";
+  return stem.length >= 3 ? `Starts with “${stem}-”` : "Ask the CEO for the password";
+}
+
 // ── passwords ────────────────────────────────────────────────
 export function hashPassword(password: string): string {
   const salt = randomBytes(16).toString("hex");

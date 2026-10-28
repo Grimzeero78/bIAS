@@ -1,12 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { Readable } from "stream";
 import { db } from "@/lib/db";
 import { getSessionUser, type SessionUser } from "@/lib/auth";
-import { objectSize, objectStream, absPath } from "@/lib/storage";
-import { stat } from "fs/promises";
+import { objectWebStream } from "@/lib/storage";
 import { audit } from "@/lib/audit";
 
 export const runtime = "nodejs";
+export const maxDuration = 300;
 
 /**
  * RBAC-gated file serving with HTTP Range support (needed for video seeking —
@@ -44,7 +43,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
     const doc = await db.document.findUnique({ where: { id } });
     if (!doc) return new NextResponse("Not found", { status: 404 });
 
-    const size = await objectSize(doc.storedPath);
+    const size = await objectSizeCompat(doc.storedPath);
     const range = req.headers.get("range");
     const isVideo = doc.type === "VIDEO";
 
@@ -57,8 +56,8 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
       if (start > end) start = Math.max(0, end - 1);
       // cap chunk to 2 MB to keep memory flat
       end = Math.min(end, start + 2 * 1024 * 1024 - 1);
-      const stream = objectStream(doc.storedPath, { start, end });
-      return new NextResponse(Readable.toWeb(stream) as unknown as ReadableStream, {
+      const { stream } = await objectWebStream(doc.storedPath, { start, end });
+      return new NextResponse(stream, {
         status: 206,
         headers: {
           "Content-Range": `bytes ${start}-${end}/${size}`,
@@ -69,35 +68,44 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
       });
     }
 
-    if (isVideo && !range) {
-      // full video — stream whole file
-      const stream = objectStream(doc.storedPath);
-      return new NextResponse(Readable.toWeb(stream) as unknown as ReadableStream, {
+    // full object
+    const { stream } = await objectWebStream(doc.storedPath);
+    if (isVideo) {
+      return new NextResponse(stream, {
         status: 200,
-        headers: { "Content-Length": String(size), "Content-Type": doc.mimeType || "video/mp4", "Accept-Ranges": "bytes" },
+        headers: {
+          "Content-Length": String(size),
+          "Content-Type": doc.mimeType || "video/mp4",
+          "Accept-Ranges": "bytes",
+        },
       });
     }
 
-    // CV / small files: inline preview for PDFs, attachment otherwise
-    const abs = absPath(doc.storedPath);
-    const s = await stat(abs);
-    const stream = objectStream(doc.storedPath);
-    if (!range || !req.headers.get("range")) {
-      const isStaff = auth.user.role !== "CANDIDATE";
-      if (isStaff) {
-        await audit(auth.user, "VIEW_DOCUMENT", "DOCUMENT", doc.id, { filename: doc.filename });
-      }
+    // CV / small files: inline preview
+    const isStaff = auth.user.role !== "CANDIDATE";
+    if (isStaff) {
+      await audit(auth.user, "VIEW_DOCUMENT", "DOCUMENT", doc.id, { filename: doc.filename });
     }
-    return new NextResponse(Readable.toWeb(stream) as unknown as ReadableStream, {
+    return new NextResponse(stream, {
       status: 200,
       headers: {
-        "Content-Length": String(s.size),
+        "Content-Length": String(size),
         "Content-Type": doc.mimeType || "application/octet-stream",
-        "Content-Disposition": `${isVideo ? "inline" : "inline"}; filename="${doc.filename.replace(/"/g, "")}"`,
+        "Content-Disposition": `inline; filename="${doc.filename.replace(/"/g, "")}"`,
       },
     });
   } catch (e) {
     console.error("[files] error:", e);
     return new NextResponse("File serving error", { status: 500 });
+  }
+}
+
+/** objectSize that also works for objects written by earlier local builds. */
+async function objectSizeCompat(storedPath: string): Promise<number> {
+  try {
+    const { objectSize } = await import("@/lib/storage");
+    return await objectSize(storedPath);
+  } catch {
+    return 0;
   }
 }
