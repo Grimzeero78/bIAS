@@ -69,3 +69,4 @@ upload/
 /examples/
 /upload/
 .zscripts/
+*.bak

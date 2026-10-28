@@ -2,11 +2,13 @@
 //
 // One-time provisioning (see README → "Deploy to Cloudflare"):
 //   npx wrangler d1 create truemerit            → paste the id below
-//   npx wrangler r2 bucket create truemerit-files
 //   npx wrangler d1 migrations apply truemerit --remote
 //   npx wrangler secret put AUTH_SECRET         (+ CEO_PASSWORD / PANEL_PASSWORD
-//                                                ZAI_BASE_URL / ZAI_API_KEY)
+//                                                ZAI_CONFIG_JSON)
 // Then:  bun run cf:deploy
+//
+// NOTE: file storage is D1-native (chunked BLOBs, migration 0002) — no R2
+// bucket or binding is needed, so the token only requires Workers + D1 edit.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "truemerit",
@@ -25,15 +27,10 @@
     {
       "binding": "DB",
       "database_name": "truemerit",
-      "database_id": "REPLACE_WITH_YOUR_D1_ID"
+      "database_id": "7347b9b0-53ff-4d2b-ae96-aeace08b451a"
     }
   ],
-  "r2_buckets": [
-    {
-      "binding": "R2",
-      "bucket_name": "truemerit-files"
-    }
-  ],
+  "r2_buckets": [],
   "vars": {
     // Access passwords default to CEO-MASTER-2026 / PANEL-ROOM-2026 —
     // override with `wrangler secret put` for real deployments.
