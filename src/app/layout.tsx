@@ -29,6 +29,10 @@ export const metadata: Metadata = {
   description:
     "AI-assisted recruitment platform: objective CV + video-interview analysis, transparent evidence-backed ranking, and full candidate transparency. The AI assists — humans decide.",
   keywords: ["recruitment", "AI hiring", "interview analysis", "candidate ranking", "transparency", "merit"],
+  // Google Search Console site ownership verification
+  verification: {
+    google: "oeDfPU047d5Lk5H24rfTv4vU2PEvHqSo0VTYtD4FUUU",
+  },
   openGraph: {
     title: "TrueMerit — Merit decides. Not connections.",
     description:
