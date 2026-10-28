@@ -90,13 +90,15 @@ describe("workers ai adapter", () => {
     expect(res.choices[0].message.content).toBe("legacy output");
   });
 
-  test("asr: passes base64 audio to whisper, returns {text}", async () => {
+  test("asr: passes byte-array audio to whisper, returns {text}", async () => {
     const log = { models: [] as string[], inputs: [] as Record<string, unknown>[] };
     const ai = fakeAI([{ text: "hello interviewer" }], log);
     const adapter = new WorkersAIAdapter(ai as never);
-    const res = await adapter.asr({ file_base64: "QUJDRA==" });
+    const res = await adapter.asr({ file_base64: "QUJDRA==" }); // decodes to "ABCD"
     expect(log.models[0]).toBe("@cf/openai/whisper");
-    expect((log.inputs[0] as { audio: string }).audio).toBe("QUJDRA==");
+    // @cf/openai/whisper's validated input shape is a plain ARRAY OF BYTES —
+    // base64 strings are rejected by the model's oneOf schema.
+    expect((log.inputs[0] as { audio: number[] }).audio).toEqual([65, 66, 67, 68]);
     expect(res.text).toBe("hello interviewer");
   });
 

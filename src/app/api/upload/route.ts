@@ -78,7 +78,7 @@ export async function POST(req: NextRequest) {
       await db.cvAnalysis.upsert({
         where: { candidateId },
         create: { candidateId, status: "PENDING" },
-        update: { status: "PENDING", error: null, progress: "Queued", overallScore: null, scoresJson: null, parsedJson: null },
+        update: { status: "PENDING", error: null, progress: "Queued", overallScore: null, scoresJson: null, parsedJson: null, updatedAt: new Date() },
       });
     } else {
       await db.videoAnalysis.upsert({
@@ -87,6 +87,7 @@ export async function POST(req: NextRequest) {
         update: {
           status: "PENDING", error: null, progress: "Queued", overallScore: null, scoresJson: null,
           observationsJson: null, transcript: null, segmentsJson: null, framesJson: null, precomputedKey: null,
+          visualJson: null, updatedAt: new Date(),
         },
       });
     }

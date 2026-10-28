@@ -215,56 +215,154 @@ Return JSON:
 Provide 8-20 observations total, spread across timestamps, each traceable to a frame timestamp or transcript segment.`;
 
 export async function analyzeVideo(candidateId: string): Promise<void> {
+  // Full run (server fast path): execute stages until done.
+  for (let i = 0; i < 80; i++) {
+    if (await runVideoStage(candidateId)) return;
+  }
+  throw new Error("Video pipeline did not converge");
+}
+
+/**
+ * Execute AT MOST ONE video pipeline stage. Returns true when finished.
+ *
+ * Manifest path (edge):
+ *   Stage 1: vision pass over frames        (idempotent via visualJson)
+ *   Stage 2: ONE ASR chunk per call         (idempotent via segmentsJson cursor)
+ *   Stage 3: fusion scoring + finalize      (idempotent — rewrites scores)
+ *
+ * Each stage persists its output, so a run killed by the Workers waitUntil
+ * lifetime cap resumes exactly where it stopped on the next poll.
+ */
+export async function runVideoStage(candidateId: string): Promise<boolean> {
   const analysis = await db.videoAnalysis.findUnique({ where: { candidateId } });
   if (!analysis) throw new Error("Video analysis record missing");
+  if (analysis.status === "COMPLETED") return true;
+
+  // Browser-prepared evidence takes priority and does NOT require a raw video
+  // document (evidence-only uploads via /api/upload/manifest are legitimate —
+  // e.g. when a recording is too large to store on the D1 driver).
+  const pre = await loadPrecomputed(analysis.precomputedKey);
   const doc = await db.document.findFirst({
     where: { candidateId, type: "VIDEO" },
     orderBy: { uploadedAt: "desc" },
   });
-  if (!doc) throw new Error("No interview video uploaded");
+  if (!pre && !doc) throw new Error("No interview video uploaded");
 
-  const pre = await loadPrecomputed(analysis.precomputedKey);
   const work = path.join(WORK_ROOT, candidateId);
   try {
-    if (pre) {
-      await db.videoAnalysis.update({ where: { candidateId }, data: { status: "PROCESSING", progress: "Using browser-prepared evidence", error: null } });
-      await runAnalysisFromManifest(candidateId, pre);
-    } else {
-      await db.videoAnalysis.update({ where: { candidateId }, data: { status: "PROCESSING", progress: "Inspecting video file", error: null } });
-      await runAnalysisWithFfmpeg(candidateId, doc.storedPath, work);
-    }
+    if (pre) return await runManifestStage(candidateId, pre);
+    // Raw-video path — only meaningful on full servers (ffmpeg available);
+    // completes in one call.
+    return await runFfmpegAll(candidateId, doc!.storedPath, work);
   } finally {
     await rm(work, { recursive: true, force: true }).catch(() => {});
   }
 }
 
 /** Edge-friendly path: consume frames + audio prepared by the browser. */
-async function runAnalysisFromManifest(candidateId: string, pre: PrecomputedManifest): Promise<void> {
-  await db.videoAnalysis.update({
-    where: { candidateId },
-    data: {
-      durationSec: pre.durationSec || null,
-      framesJson: JSON.stringify(pre.frames.map((f) => ({ t: f.t }))),
-      progress: "AI visual analysis of frames",
-    },
-  });
+async function runManifestStage(candidateId: string, pre: PrecomputedManifest): Promise<boolean> {
+  const current = await db.videoAnalysis.findUniqueOrThrow({ where: { candidateId } });
 
-  const frames: Frame[] = pre.frames.map((f) => ({ t: f.t, file: "(browser)", dataUrl: f.dataUrl }));
-  const visual = await visionPass(frames);
+  // ── Stage 1 — vision pass (resumes via persisted visualJson) ──
+  let visual: unknown = null;
+  if (current.visualJson) {
+    try {
+      visual = JSON.parse(current.visualJson);
+    } catch {
+      visual = null;
+    }
+  }
+  if (!visual) {
+    await db.videoAnalysis.update({
+      where: { candidateId },
+      data: {
+        status: "PROCESSING",
+        error: null,
+        durationSec: pre.durationSec || null,
+        framesJson: JSON.stringify(pre.frames.map((f) => ({ t: f.t }))),
+        progress: "AI visual analysis of frames",
+        updatedAt: new Date(),
+      },
+    });
+    const frames: Frame[] = pre.frames.map((f) => ({ t: f.t, file: "(browser)", dataUrl: f.dataUrl }));
+    visual = await visionPass(frames);
+    await db.videoAnalysis.update({
+      where: { candidateId },
+      data: {
+        visualJson: JSON.stringify(visual),
+        progress: pre.audio.length ? "Transcribing speech (ASR)" : "Fusing evidence into criterion scores",
+        updatedAt: new Date(),
+      },
+    });
+    return false; // next stage call: ASR or fusion
+  }
 
-  await db.videoAnalysis.update({ where: { candidateId }, data: { progress: "Transcribing speech (ASR)" } });
-  const segments = pre.audio.length ? await transcribeBase64Chunks(pre.audio) : [];
-  await finishVideoAnalysis(candidateId, visual, segments);
+  // ── Stage 2 — ASR, ONE chunk per call (cursor = segmentsJson length) ──
+  let segments: { start: number; end: number; text: string }[] = [];
+  if (current.segmentsJson) {
+    try {
+      segments = JSON.parse(current.segmentsJson) as { start: number; end: number; text: string }[];
+    } catch {
+      segments = [];
+    }
+  }
+  if (pre.audio.length > segments.length) {
+    await db.videoAnalysis.update({
+      where: { candidateId },
+      data: {
+        status: "PROCESSING",
+        error: null,
+        progress: `Transcribing speech (ASR) ${segments.length + 1}/${pre.audio.length}`,
+        updatedAt: new Date(),
+      },
+    });
+    const c = pre.audio[segments.length];
+    try {
+      const zai = await getZAI();
+      const res = await zai.audio.asr.create({ file_base64: c.wavBase64 });
+      const text = (res?.text || "").trim();
+      if (text) segments.push({ start: c.startSec, end: c.startSec + CHUNK_SEC, text });
+      else segments.push({ start: c.startSec, end: c.startSec + CHUNK_SEC, text: "" });
+    } catch (e) {
+      // Advance the cursor even on failure (empty placeholder) so a
+      // permanently broken chunk cannot wedge the pipeline in a retry loop.
+      console.error(`[video] ASR chunk @${c.startSec}s failed:`, e instanceof Error ? e.message : e);
+      segments.push({ start: c.startSec, end: c.startSec + CHUNK_SEC, text: "" });
+    }
+    const spoken = segments.filter((s) => s.text);
+    await db.videoAnalysis.update({
+      where: { candidateId },
+      data: {
+        segmentsJson: JSON.stringify(segments),
+        transcript: spoken.map((s) => `[${fmtT(s.start)}] ${s.text}`).join("\n").slice(0, 50000),
+        progress: pre.audio.length > segments.length ? `Transcribing speech (ASR) ${segments.length + 1}/${pre.audio.length}` : "Fusing evidence into criterion scores",
+        updatedAt: new Date(),
+      },
+    });
+    return false; // next stage call: more ASR or fusion
+  }
+
+  // ── Stage 3 — fusion + finalize ──
+  await db.videoAnalysis.update({ where: { candidateId }, data: { progress: "Fusing evidence into criterion scores", updatedAt: new Date() } });
+  await finishVideoAnalysis(candidateId, visual, segments.filter((s) => s.text), pre.audio.length > 0);
+  return true;
 }
 
 /** Full-server path (sandbox / API clients): ffmpeg frames + audio then ASR. */
-async function runAnalysisWithFfmpeg(candidateId: string, storedPath: string, work: string): Promise<void> {
+async function runFfmpegAll(candidateId: string, storedPath: string, work: string): Promise<boolean> {
+  await db.videoAnalysis.update({ where: { candidateId }, data: { status: "PROCESSING", progress: "Inspecting video file", error: null, updatedAt: new Date() } });
   await mkdir(work, { recursive: true });
   const src = srcPath(storedPath);
   const { duration, hasAudio } = await ffprobeDuration(src);
   await db.videoAnalysis.update({ where: { candidateId }, data: { durationSec: duration || null, progress: "Extracting interview frames" } });
 
-  const frames = await extractFrames(src, work, duration);
+  const frames = await extractFrames(src, work, duration).catch((e: unknown) => {
+    // Edge runtimes have no ffmpeg — surface an actionable message instead of
+    // a bare spawn/ENOENT failure.
+    throw new Error(
+      `Could not extract frames from the recording (${e instanceof Error ? e.message.slice(0, 120) : "unknown"}). On edge deployments re-upload the video from the browser so analysis evidence is prepared client-side.`
+    );
+  });
   await db.videoAnalysis.update({
     where: { candidateId },
     data: { framesJson: JSON.stringify(frames.map((f) => ({ t: f.t }))), progress: "AI visual analysis of frames" },
@@ -276,6 +374,7 @@ async function runAnalysisWithFfmpeg(candidateId: string, storedPath: string, wo
   const chunks = await extractAudioChunks(src, work, hasAudio);
   const segments = await transcribeChunks(chunks);
   await finishVideoAnalysis(candidateId, visual, segments, chunks.length > 0);
+  return true;
 }
 
 async function finishVideoAnalysis(
@@ -317,7 +416,7 @@ CRITERIA:
 ${rubric}
 
 VISUAL FINDINGS:
-${JSON.stringify(visual).slice(0, 20000)}
+${JSON.stringify(visual).slice(0, 10000)}
 
 TRANSCRIPT (empty means no usable audio):
 ${transcript || "(no transcript — audio missing or unintelligible)"}
@@ -364,6 +463,7 @@ Return the JSON now.`
       observationsJson: JSON.stringify(observations),
       overallScore: overall,
       processedAt: new Date(),
+      updatedAt: new Date(),
     },
   });
 }

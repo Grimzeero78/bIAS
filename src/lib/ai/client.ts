@@ -218,7 +218,11 @@ export class WorkersAIAdapter implements MeritAIClient {
   }
 
   async asr(body: { file_base64: string }): Promise<{ text: string }> {
-    const out = await this.ai.run(WA_ASR_MODEL, { audio: body.file_base64 });
+    // @cf/openai/whisper rejects base64 strings (oneOf schema mismatch:
+    // "Type mismatch of '/audio', 'array' not in 'string'") — the binding's
+    // validated input shape is a plain ARRAY OF BYTES.
+    const bytes = Uint8Array.from(atob(body.file_base64), (c) => c.charCodeAt(0));
+    const out = await this.ai.run(WA_ASR_MODEL, { audio: Array.from(bytes) });
     const text = WorkersAIAdapter.responseText(out);
     return { text };
   }

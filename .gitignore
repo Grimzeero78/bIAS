@@ -61,7 +61,6 @@ src/generated/
 /storage/
 /download/
 /scripts/e2e/*.png
-upload/
 .dev.vars
 .worklog
 /skills/

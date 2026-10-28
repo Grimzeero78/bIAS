@@ -20,7 +20,8 @@ function key(candidateId: string, kind: "CV" | "VIDEO") {
   return `${kind}:${candidateId}`;
 }
 
-async function runJob(candidateId: string, kind: "CV" | "VIDEO") {
+/** Shared executor for both the waitUntil fast path and the inline stepper. */
+async function executeJob(candidateId: string, kind: "CV" | "VIDEO") {
   const k = key(candidateId, kind);
   try {
     if (kind === "CV") {
@@ -64,15 +65,26 @@ export function enqueueAnalysis(candidateId: string, kind: "CV" | "VIDEO") {
   try {
     const ctx = getCloudflareContext().ctx as { waitUntil?: (p: Promise<unknown>) => void } | undefined;
     if (ctx?.waitUntil) {
-      ctx.waitUntil(runJob(candidateId, kind));
+      ctx.waitUntil(executeJob(candidateId, kind));
       return;
     }
   } catch {
     /* not on Cloudflare */
   }
-  void runJob(candidateId, kind);
+  void executeJob(candidateId, kind);
 }
 
 export function isRunning(candidateId: string, kind: "CV" | "VIDEO") {
   return running.has(key(candidateId, kind));
+}
+
+/**
+ * Inline stepper for the analysis status endpoint: runs the pipeline to the
+ * next persist point (bounded AI work) in the poll request itself. Used to
+ * re-drive runs whose waitUntil lifetime was cut by the Workers runtime —
+ * their row is left PROCESSING with a stale heartbeat, which waitUntil
+ * re-enqueueing alone can never fix.
+ */
+export async function runInline(candidateId: string, kind: "CV" | "VIDEO"): Promise<void> {
+  await executeJob(candidateId, kind);
 }

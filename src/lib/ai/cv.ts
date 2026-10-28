@@ -46,6 +46,18 @@ async function extractPdfText(buf: Buffer): Promise<string> {
   const pdfjs = (await import("pdfjs-dist/legacy/build/pdf.mjs")) as unknown as {
     getDocument: (opts: Record<string, unknown>) => { promise: Promise<PdfDoc> };
   };
+  // pdf.js resolves its parsing worker through a COMPUTED dynamic import
+  // ("import(this.workerSrc)") which bundlers cannot trace — on edge builds
+  // the worker file is simply absent and extraction dies with
+  // `Setting up fake worker failed: "No such module pdf.worker.mjs"`.
+  // Preloading the worker module into globalThis.pdfjsWorker is pdf.js's
+  // official main-thread escape hatch: _setupFakeWorkerGlobal checks it
+  // FIRST and skips the dynamic import entirely. The literal specifier here
+  // keeps the worker file traced into the deployment bundle.
+  const g = globalThis as Record<string, unknown>;
+  if (!g.pdfjsWorker) {
+    g.pdfjsWorker = await import("pdfjs-dist/legacy/build/pdf.worker.mjs");
+  }
   const doc = await pdfjs.getDocument({
     data: new Uint8Array(buf),
     isEvalSupported: false,
@@ -136,32 +148,65 @@ Schema:
  "experience": [{"role": string, "organisation": string, "period": string, "highlights": string}],
  "strengths": string[], "concerns": string[]}`;
 
+/** Heartbeat stamp included in every stage write — drives stale-run resume. */
+const hb = () => ({ updatedAt: new Date() });
+
 export async function analyzeCv(candidateId: string): Promise<void> {
+  // Full run (server fast path): execute stages until done.
+  for (let i = 0; i < 10; i++) {
+    if (await runCvStage(candidateId)) return;
+  }
+  throw new Error("CV pipeline did not converge");
+}
+
+/**
+ * Execute AT MOST ONE CV pipeline stage. Returns true when finished.
+ *
+ * Stage 1: extraction + structural parse  (idempotent via parsedJson)
+ * Stage 2: rubric scoring + finalize      (idempotent — rewrites scores)
+ *
+ * Each stage persists its output, so a run killed by the Workers waitUntil
+ * lifetime cap resumes from where it stopped on the next poll.
+ */
+export async function runCvStage(candidateId: string): Promise<boolean> {
   const cvAnalysis = await db.cvAnalysis.findUnique({ where: { candidateId } });
   if (!cvAnalysis) throw new Error("CV analysis record missing");
+  if (cvAnalysis.status === "COMPLETED") return true;
+
   const doc = await db.document.findFirst({
     where: { candidateId, type: "CV" },
     orderBy: { uploadedAt: "desc" },
   });
   if (!doc) throw new Error("No CV document uploaded");
 
-  await db.cvAnalysis.update({ where: { candidateId }, data: { status: "PROCESSING", progress: "Extracting text from document", error: null } });
+  // ── Stage 1 — extraction + structured parse ──
+  let parsed: CvParsed;
+  if (cvAnalysis.parsedJson) {
+    try {
+      parsed = JSON.parse(cvAnalysis.parsedJson) as CvParsed;
+    } catch {
+      throw new Error("Stored CV parse is corrupt — re-upload the CV");
+    }
+  } else {
+    await db.cvAnalysis.update({ where: { candidateId }, data: { status: "PROCESSING", progress: "Extracting text from document", error: null, ...hb() } });
 
-  const rawText = await extractCvText(doc.filename, doc.storedPath);
-  if (!rawText || rawText.length < 20) {
-    throw new Error("Could not extract readable text from the CV (scanned/image-only PDFs are not supported)");
+    const rawText = await extractCvText(doc.filename, doc.storedPath);
+    if (!rawText || rawText.length < 20) {
+      throw new Error("Could not extract readable text from the CV (scanned/image-only PDFs are not supported)");
+    }
+
+    await db.cvAnalysis.update({ where: { candidateId }, data: { rawText: rawText.slice(0, 60000), progress: "AI parsing CV structure", ...hb() } });
+
+    parsed = await llmJson<CvParsed>(PARSE_SYSTEM, `Parse this CV:\n\n${rawText.slice(0, 40000)}`);
+
+    await db.cvAnalysis.update({
+      where: { candidateId },
+      data: { parsedJson: JSON.stringify(parsed), progress: "Scoring against job criteria", ...hb() },
+    });
+    return false; // scoring runs on the next stage call
   }
 
-  await db.cvAnalysis.update({ where: { candidateId }, data: { rawText: rawText.slice(0, 60000), progress: "AI parsing CV structure" } });
-
-  const parsed = await llmJson<CvParsed>(PARSE_SYSTEM, `Parse this CV:\n\n${rawText.slice(0, 40000)}`);
-
-  await db.cvAnalysis.update({
-    where: { candidateId },
-    data: { parsedJson: JSON.stringify(parsed), progress: "Scoring against job criteria" },
-  });
-
-  // ── rubric scoring against the job's CV criteria ──
+  // ── Stage 2 — rubric scoring against the job's CV criteria ──
   const candidate = await db.candidate.findUniqueOrThrow({
     where: { id: candidateId },
     include: { job: { include: { criteria: true } } },
@@ -216,8 +261,10 @@ Return JSON: {"scores":[{"criterionId":"...","score":0-100,"rationale":"..."}]} 
       scoresJson: JSON.stringify(scores),
       overallScore: overall,
       processedAt: new Date(),
+      ...hb(),
     },
   });
+  return true;
 }
 
 /** Optional freeform AI summary used on the report page. */

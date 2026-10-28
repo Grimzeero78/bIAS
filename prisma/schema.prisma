@@ -112,6 +112,7 @@ model CvAnalysis {
   overallScore  Float?
   error         String?
   processedAt   DateTime?
+  updatedAt     DateTime? // stage heartbeat — polls resume PROCESSING rows whose heartbeat went stale
   candidate     Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
 }
 
@@ -127,9 +128,11 @@ model VideoAnalysis {
   scoresJson      String? // [{criterionId, name, score, rationale}]
   observationsJson String? // [{timestamp, category, observation}] timestamped evidence
   precomputedKey  String? // storage key of a browser-prepared frames+audio manifest (edge deployments)
+  visualJson      String? // persisted vision-pass output — lets a killed run resume past stage 1
   overallScore    Float?
   error           String?
   processedAt     DateTime?
+  updatedAt       DateTime? // stage heartbeat — polls resume PROCESSING rows whose heartbeat went stale
   candidate       Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
 }
 

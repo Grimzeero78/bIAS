@@ -35,6 +35,10 @@ echo "── applying D1 migrations ──"
 CLOUDFLARE_API_TOKEN=$CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID bunx wrangler d1 migrations apply truemerit --remote
 
 echo "── building + deploying ──"
+# NOTE: `opennextjs-cloudflare deploy` does NOT build — the build step is
+# separate (schema regen + prisma generate + next build + worker bundle).
+# Shipping without cf:build silently re-uploads a stale .open-next directory.
+CLOUDFLARE_API_TOKEN=$CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID bun run cf:build
 CLOUDFLARE_API_TOKEN=$CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID bun run cf:deploy
 
 echo ""
