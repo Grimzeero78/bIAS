@@ -30,6 +30,11 @@
       "database_id": "7347b9b0-53ff-4d2b-ae96-aeace08b451a"
     }
   ],
+  // Zero-config AI: llama-3.3-70b (text), llama-4-scout (vision), whisper (ASR)
+  // run on the account's free daily allocation — see src/lib/ai/client.ts
+  "ai": {
+    "binding": "AI"
+  },
   "r2_buckets": [],
   "vars": {
     // Access passwords default to CEO-MASTER-2026 / PANEL-ROOM-2026 —
