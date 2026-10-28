@@ -1,0 +1,159 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+// SQLite for this sandbox. To move to PostgreSQL in production:
+// change provider to "postgresql" and keep the schema as-is
+// (no SQLite-specific features are used).
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// RBAC / USERS
+// ─────────────────────────────────────────────────────────────
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  name         String
+  role         String // ADMIN | INTERVIEWER | CANDIDATE
+  candidateId  String? // set when role = CANDIDATE, links to Candidate row
+  active       Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+// ─────────────────────────────────────────────────────────────
+// REQUISITION / JOB OPENING
+// ─────────────────────────────────────────────────────────────
+model JobOpening {
+  id                 String    @id @default(cuid())
+  title              String
+  department         String?
+  description        String
+  requirements       String // free-text requirements the AI scores CVs against
+  cvWeight           Int       @default(40) // % weight of CV score 0-100
+  videoWeight        Int       @default(60) // % weight of Video score 0-100
+  status             String    @default("OPEN") // OPEN | CLOSED
+  candidateVisibility Boolean  @default(false) // may candidates view their own report?
+  createdById        String
+  createdByName      String
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  candidates         Candidate[]
+  criteria           Criterion[]
+}
+
+// Analysis criterion configured by the Interviewer per job.
+// category=CV criteria are scored from the parsed CV,
+// category=VIDEO criteria from the video analysis engine.
+model Criterion {
+  id           String  @id @default(cuid())
+  jobId        String
+  name         String // e.g. "Confidence", "English Proficiency"
+  description  String // what the AI should look for
+  category     String // CV | VIDEO
+  weight       Int     @default(1) // relative weight inside its category
+  isMandatory  Boolean @default(false) // breach => flagged + penalised
+  minThreshold Int? // 0-100 minimum acceptable score when mandatory
+  createdAt    DateTime @default(now())
+  job          JobOpening @relation(fields: [jobId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────────────────────────────────────────
+// CANDIDATES & DOCUMENTS
+// ─────────────────────────────────────────────────────────────
+model Candidate {
+  id         String   @id @default(cuid())
+  jobId      String
+  fullName   String
+  email      String
+  phone      String?
+  accessCode String   @unique // candidate portal login code
+  status     String   @default("ACTIVE") // ACTIVE | DISQUALIFIED
+  createdAt  DateTime @default(now())
+  job        JobOpening @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  documents  Document[]
+  cvAnalysis CvAnalysis?
+  videoAnalysis VideoAnalysis?
+  evaluation Evaluation?
+}
+
+model Document {
+  id          String   @id @default(cuid())
+  candidateId String
+  type        String // CV | VIDEO
+  filename    String // original filename
+  storedPath  String // path inside storage root (never exposed to client)
+  mimeType    String
+  sizeBytes   Int
+  uploadedAt  DateTime @default(now())
+  candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────────────────────────────────────────
+// AI ANALYSES
+// ─────────────────────────────────────────────────────────────
+model CvAnalysis {
+  id            String    @id @default(cuid())
+  candidateId   String    @unique
+  status        String    @default("PENDING") // PENDING | PROCESSING | COMPLETED | FAILED
+  progress      String?
+  rawText       String?
+  parsedJson    String? // {skills[], education[], experience[], strengths[], concerns[]}
+  scoresJson    String? // [{criterionId, name, score, rationale}]
+  overallScore  Float?
+  error         String?
+  processedAt   DateTime?
+  candidate     Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+}
+
+model VideoAnalysis {
+  id              String    @id @default(cuid())
+  candidateId     String    @unique
+  status          String    @default("PENDING")
+  progress        String?
+  durationSec     Float?
+  transcript      String?
+  segmentsJson    String? // [{start, end, text}] audio segments
+  framesJson      String? // [{t, path}] extracted frame timestamps
+  scoresJson      String? // [{criterionId, name, score, rationale}]
+  observationsJson String? // [{timestamp, category, observation}] timestamped evidence
+  overallScore    Float?
+  error           String?
+  processedAt     DateTime?
+  candidate       Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────────────────────────────────────────
+// FINAL EVALUATION / RANKING
+// ─────────────────────────────────────────────────────────────
+model Evaluation {
+  id            String    @id @default(cuid())
+  candidateId   String    @unique
+  cvScore       Float
+  videoScore    Float
+  finalScore    Float
+  rank          Int? // 1 = best
+  justification String? // AI "Why" narrative
+  flagsJson     String? // mandatory-criterion breaches etc.
+  computedAt    DateTime  @default(now())
+  candidate     Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────────────────────────────────────────
+// AUDIT TRAIL (anti-corruption transparency)
+// ─────────────────────────────────────────────────────────────
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actorName  String
+  actorRole  String
+  action     String // e.g. UPLOAD_VIDEO, RUN_EVALUATION, VIEW_REPORT
+  entityType String // JOB | CANDIDATE | DOCUMENT | EVALUATION | AUTH
+  entityId   String?
+  details    String?
+  createdAt  DateTime @default(now())
+}

@@ -1,0 +1,295 @@
+import { execFile } from "child_process";
+import { promisify } from "util";
+import { readFile, readdir, rm, mkdir } from "fs/promises";
+import path from "path";
+import { llmJson } from "./client";
+import { getZAI, extractJson } from "./client";
+import { clampScore, weightedMean, type CriterionScore } from "./cv";
+import { db } from "@/lib/db";
+
+const exec = promisify(execFile);
+
+/**
+ * VIDEO INTERVIEW ANALYSIS PIPELINE
+ *
+ * A1. ffprobe                → duration / has-audio
+ * A2. ffmpeg                 → up to 12 evenly-spaced JPEG frames (timestamps recorded)
+ * A3. ffmpeg                 → mono 16 kHz WAV, split into 60 s chunks
+ * A4. ASR per chunk          → transcript segments with chunk-accurate timestamps
+ * A5. Vision LLM (frames)    → visual findings: posture, eye contact, dressing,
+ *                              confidence signals, fidgeting — with frame timestamps
+ * A6. Fusion LLM (text)      → merges visual findings + transcript, scores every
+ *                              VIDEO criterion 0-100 and emits timestamped evidence
+ * Overall = weighted mean of criterion scores.
+ *
+ * Analysis window is capped to the first 10 minutes to keep processing time sane.
+ */
+
+const WORK_ROOT = path.join(process.cwd(), "storage", "tmp");
+const MAX_ANALYSIS_SEC = 600;
+const MAX_FRAMES = 12;
+// The ASR service accepts audio up to ~30 s per request — chunk at 28 s to stay safely inside the limit.
+const CHUNK_SEC = 28;
+const MAX_CHUNKS = 16; // ≈ first 7.5 minutes of speech
+
+function srcPath(storedPath: string) {
+  return path.join(process.cwd(), "storage", "uploads", storedPath);
+}
+
+async function ffprobeDuration(file: string): Promise<{ duration: number; hasAudio: boolean }> {
+  try {
+    const { stdout } = await exec("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-select_streams", "a",
+      "-show_entries", "stream=codec_type",
+      "-of", "json", file,
+    ], { timeout: 30000 });
+    const j = JSON.parse(stdout);
+    const duration = parseFloat(j?.format?.duration || "0");
+    const hasAudio = (j?.streams || []).some((s: { codec_type?: string }) => s.codec_type === "audio");
+    return { duration: Number.isFinite(duration) ? duration : 0, hasAudio };
+  } catch {
+    return { duration: 0, hasAudio: true };
+  }
+}
+
+interface Frame { t: number; file: string; dataUrl: string }
+
+async function extractFrames(file: string, work: string, duration: number): Promise<Frame[]> {
+  await mkdir(work, { recursive: true });
+  const span = Math.min(duration > 5 ? duration : MAX_ANALYSIS_SEC, MAX_ANALYSIS_SEC);
+  // interval so we end up with ~MAX_FRAMES frames across the span
+  const interval = Math.max(span / MAX_FRAMES, 5);
+  await exec("ffmpeg", [
+    "-y", "-i", file,
+    "-vf", `fps=1/${interval},scale=768:-2`,
+    "-frames:v", String(MAX_FRAMES),
+    "-q:v", "4",
+    path.join(work, "frame_%02d.jpg"),
+  ], { timeout: 120000 });
+
+  const files = (await readdir(work)).filter((f) => f.startsWith("frame_")).sort();
+  const frames: Frame[] = [];
+  for (let i = 0; i < files.length; i++) {
+    const buf = await readFile(path.join(work, files[i]));
+    frames.push({
+      t: Math.round(i * interval * 10) / 10,
+      file: files[i],
+      dataUrl: `data:image/jpeg;base64,${buf.toString("base64")}`,
+    });
+  }
+  return frames;
+}
+
+async function extractAudioChunks(file: string, work: string, hasAudio: boolean): Promise<{ file: string; start: number }[]> {
+  if (!hasAudio) return [];
+  try {
+    await exec("ffmpeg", [
+      "-y", "-i", file, "-vn",
+      "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le",
+      "-t", String(MAX_ANALYSIS_SEC),
+      "-f", "segment", "-segment_time", String(CHUNK_SEC),
+      path.join(work, "aud_%03d.wav"),
+    ], { timeout: 180000 });
+    const files = (await readdir(work)).filter((f) => f.startsWith("aud_")).sort().slice(0, MAX_CHUNKS);
+    return files.map((f, i) => ({ file: path.join(work, f), start: i * CHUNK_SEC }));
+  } catch (e) {
+    console.error("[video] audio extraction failed", e);
+    return [];
+  }
+}
+
+async function transcribeChunks(chunks: { file: string; start: number }[]): Promise<{ start: number; end: number; text: string }[]> {
+  const zai = await getZAI();
+  const segments: { start: number; end: number; text: string }[] = [];
+  for (const c of chunks) {
+    try {
+      const buf = await readFile(c.file);
+      const res = await zai.audio.asr.create({ file_base64: buf.toString("base64") });
+      const text = (res?.text || "").trim();
+      if (text) segments.push({ start: c.start, end: c.start + CHUNK_SEC, text });
+    } catch (e) {
+      console.error(`[video] ASR chunk @${c.start}s failed:`, e instanceof Error ? e.message : e);
+    }
+  }
+  return segments;
+}
+
+const VISUAL_SYSTEM = `You are a professional interview body-language analyst. You receive a sequence of frames from a recorded video interview, each labelled with its timestamp in seconds.
+Analyse ONLY what is visually observable. Return JSON:
+{"person_present": boolean,
+ "dressing": string (describe attire & professionalism),
+ "posture": string,
+ "eye_contact": string (note the candidate looking at/away from camera),
+ "gestures_fidgeting": string,
+ "confidence_signals": string,
+ "observations": [{"t": number (seconds, use the frame timestamps), "category": string (one of Confidence|Dressing|Body Language|Engagement|Other), "observation": string (short factual note)}]
+Give 6-14 observations spread across the timeline. Be objective and neutral; never guess identity, gender-appropriateness of clothing beyond professionalism, ethnicity or age.`;
+
+async function visionPass(frames: Frame[]): Promise<unknown> {
+  if (!frames.length) throw new Error("No frames could be extracted from the video");
+  const frameLabels = frames.map((f, i) => `Frame ${i + 1} = t=${f.t}s`).join("; ");
+  const zai = await getZAI();
+  const content: Record<string, unknown>[] = [
+    {
+      type: "text",
+      text: `These are ${frames.length} sequential frames from a recorded job interview video.\n${frameLabels}\n\n${VISUAL_SYSTEM}`,
+    },
+    ...frames.map((f) => ({ type: "image_url", image_url: { url: f.dataUrl } })),
+  ];
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await zai.chat.completions.createVision({
+        messages: [{ role: "user", content }],
+        thinking: { type: "disabled" },
+      });
+      const raw = res.choices[0]?.message?.content || "";
+      const parsed = extractJson<unknown>(raw);
+      if (parsed) return parsed;
+      throw new Error("vision returned unparseable JSON");
+    } catch (e) {
+      lastErr = e;
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error("Vision analysis failed");
+}
+
+const FUSION_SYSTEM = `You are an impartial interview assessment engine. You receive:
+(a) VISUAL FINDINGS from a frame-analysis pass (timestamped), and
+(b) a TIMESTAMPED TRANSCRIPT of the spoken audio.
+Your job: score the candidate on each listed VIDEO criterion (0-100), and produce a timestamped evidence list.
+
+Scoring rules:
+- 50 = barely acceptable for a professional role, 80+ = strong, <40 = a real weakness.
+- Score ONLY from the provided evidence. No speculation beyond it.
+- Criteria that are purely verbal (e.g. English proficiency, answer quality) must be scored from the transcript; if there is NO transcript at all, score verbal criteria at 45 with the rationale "no clear audio transcript available" and flag it.
+- Dressing/attire and visual posture criteria come from the visual findings.
+- Blend criteria like Confidence from both modalities.
+Return JSON:
+{"scores": [{"criterionId": "...", "score": 0-100, "rationale": "1-3 factual sentences citing evidence"}],
+ "observations": [{"t": number_seconds, "category": string, "observation": string, "quote": string_optional_spoken_quote}],
+ "overall_impression": string}
+Provide 8-20 observations total, spread across timestamps, each traceable to a frame timestamp or transcript segment.`;
+
+export async function analyzeVideo(candidateId: string): Promise<void> {
+  const analysis = await db.videoAnalysis.findUnique({ where: { candidateId } });
+  if (!analysis) throw new Error("Video analysis record missing");
+  const doc = await db.document.findFirst({
+    where: { candidateId, type: "VIDEO" },
+    orderBy: { uploadedAt: "desc" },
+  });
+  if (!doc) throw new Error("No interview video uploaded");
+
+  const work = path.join(WORK_ROOT, candidateId);
+  try {
+    await db.videoAnalysis.update({ where: { candidateId }, data: { status: "PROCESSING", progress: "Inspecting video file", error: null } });
+    const src = srcPath(doc.storedPath);
+    const { duration, hasAudio } = await ffprobeDuration(src);
+    await db.videoAnalysis.update({ where: { candidateId }, data: { durationSec: duration || null, progress: "Extracting interview frames" } });
+
+    const frames = await extractFrames(src, work, duration);
+    await db.videoAnalysis.update({
+      where: { candidateId },
+      data: { framesJson: JSON.stringify(frames.map((f) => ({ t: f.t }))), progress: "AI visual analysis of frames" },
+    });
+
+    const visual = await visionPass(frames);
+
+    await db.videoAnalysis.update({ where: { candidateId }, data: { progress: "Transcribing speech (ASR)" } });
+    const chunks = await extractAudioChunks(src, work, hasAudio);
+    const segments = await transcribeChunks(chunks);
+    if (chunks.length > 0) {
+      await db.videoAnalysis.update({
+        where: { candidateId },
+        data: {
+          transcript: segments.map((s) => `[${fmtT(s.start)}] ${s.text}`).join("\n").slice(0, 50000),
+          segmentsJson: JSON.stringify(segments),
+          progress: "Fusing evidence into criterion scores",
+        },
+      });
+    } else {
+      await db.videoAnalysis.update({ where: { candidateId }, data: { progress: "Fusing evidence into criterion scores" } });
+    }
+
+    const candidate = await db.candidate.findUniqueOrThrow({
+      where: { id: candidateId },
+      include: { job: { include: { criteria: true } } },
+    });
+    const videoCriteria = candidate.job.criteria.filter((c) => c.category === "VIDEO");
+
+    const rubric = videoCriteria.map((c, i) => `${i + 1}. id=${c.id} | ${c.name} (weight ${c.weight}) — ${c.description}`).join("\n");
+    const transcript = segments.map((s) => `[${s.start}s-${s.end}s] ${s.text}`).join("\n").slice(0, 24000);
+
+    const fusion = await llmJson<{
+      scores: { criterionId: string; score: number; rationale: string }[];
+      observations: { t: number; category: string; observation: string; quote?: string }[];
+      overall_impression: string;
+    }>(
+      FUSION_SYSTEM,
+      `JOB: ${candidate.job.title}
+CRITERIA:
+${rubric}
+
+VISUAL FINDINGS:
+${JSON.stringify(visual).slice(0, 20000)}
+
+TRANSCRIPT (empty means no usable audio):
+${transcript || "(no transcript — audio missing or unintelligible)"}
+
+Return the JSON now.`
+    );
+
+    const scores: CriterionScore[] = (fusion.scores || []).map((s) => {
+      const crit = videoCriteria.find((c) => c.id === s.criterionId);
+      return {
+        criterionId: s.criterionId,
+        name: crit?.name ?? "Criterion",
+        score: clampScore(s.score),
+        rationale: String(s.rationale || "").slice(0, 800),
+      };
+    });
+    for (const c of videoCriteria) {
+      if (!scores.some((s) => s.criterionId === c.id)) {
+        scores.push({ criterionId: c.id, name: c.name, score: 0, rationale: "No score returned by AI for this criterion; treated as not evidenced." });
+      }
+    }
+
+    const observations = (fusion.observations || [])
+      .filter((o) => o && typeof o.observation === "string")
+      .map((o) => ({
+        t: Math.max(0, Math.round((Number(o.t) || 0) * 10) / 10),
+        category: String(o.category || "General").slice(0, 40),
+        observation: String(o.observation).slice(0, 400),
+        quote: o.quote ? String(o.quote).slice(0, 300) : undefined,
+      }))
+      .sort((a, b) => a.t - b.t)
+      .slice(0, 60);
+
+    const overall = weightedMean(
+      scores.map((s) => ({ score: s.score, weight: videoCriteria.find((c) => c.id === s.criterionId)?.weight ?? 1 }))
+    );
+
+    await db.videoAnalysis.update({
+      where: { candidateId },
+      data: {
+        status: "COMPLETED",
+        progress: null,
+        scoresJson: JSON.stringify(scores),
+        observationsJson: JSON.stringify(observations),
+        overallScore: overall,
+        processedAt: new Date(),
+      },
+    });
+  } finally {
+    await rm(work, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+export function fmtT(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  const m = Math.floor(s / 60);
+  return `${String(m).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
