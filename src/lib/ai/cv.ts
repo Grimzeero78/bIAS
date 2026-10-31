@@ -1,11 +1,13 @@
-import path from "path";
-import { llmJson, llmText, extractJson } from "./client";
+import { llmJson, llmText, extractJson, getZAI } from "./client";
+import { extractTextFromCvBuffer } from "./cv-extract";
 import { db } from "@/lib/db";
 import { getObject } from "@/lib/storage";
 
 /**
  * CV ANALYSIS PIPELINE
- * 1. Extract raw text from PDF / DOCX / TXT
+ * 1. Extract raw text from virtually ANY document format
+ *    (pdf, docx, doc, txt, md, html, rtf, odt, pptx, xlsx, epub, pages,
+ *     csv, xml, images via OCR — see cv-extract.ts)
  * 2. LLM structured parse  → skills, education, experience, strengths, concerns
  * 3. LLM rubric scoring    → per-CV-criterion score + rationale
  * Overall score = weighted mean of criterion scores (0-100).
@@ -88,24 +90,41 @@ interface PdfDoc {
   destroy: () => Promise<void>;
 }
 
+/** Image CVs (JPG/PNG/screenshots) → OCR through the vision model. */
+async function visionOcr(buf: Buffer, mime: string): Promise<string> {
+  const dataUri = `data:${mime};base64,${buf.toString("base64")}`;
+  const zai = await getZAI();
+  const res = await zai.chat.completions.createVision({
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text:
+              "This is a photo or screenshot of a CV/resume. Transcribe ALL visible text exactly — " +
+              "name, contact details, summary, skills, education and every experience entry with dates. " +
+              "Preserve reading order with line breaks. Output the transcription only, no commentary.",
+          },
+          { type: "image_url", image_url: { url: dataUri } },
+        ],
+      },
+    ],
+  });
+  const text = res.choices?.[0]?.message?.content ?? "";
+  if (!text.trim()) throw new Error("Vision OCR produced no text");
+  return text;
+}
+
 export async function extractCvText(filename: string, storedPath: string): Promise<string> {
-  // Storage-abstracted read — works on local disk AND Cloudflare R2.
+  // Storage-abstracted read — works on local disk AND Cloudflare D1/R2.
   const buf = await getObject(storedPath);
-  const ext = path.extname(filename).toLowerCase();
-  if (ext === ".pdf") return extractPdfText(buf);
-  if (ext === ".docx") {
-    const mammoth = await import("mammoth");
-    const out = await mammoth.extractRawText({ buffer: buf });
-    return (out.value || "").trim();
-  }
-  if (ext === ".txt" || ext === ".md") {
-    return buf.toString("utf-8").trim();
-  }
-  if (ext === ".doc") {
-    // legacy binary .doc — best-effort strip
-    return buf.toString("utf-8").replace(/[^\x20-\x7E\n\r\t\u00A0-\u024F\u2000-\u206F]/g, " ").trim();
-  }
-  throw new Error(`Unsupported CV format: ${ext || "unknown"} (use PDF, DOCX or TXT)`);
+  const text = await extractTextFromCvBuffer(filename, buf, {
+    extractPdf: extractPdfText,
+    visionOcr,
+  });
+  if (text && text.trim().length > 0) return text.trim();
+  throw new Error(`No readable text found in "${filename}"`);
 }
 
 export interface CvParsed {
@@ -192,7 +211,10 @@ export async function runCvStage(candidateId: string): Promise<boolean> {
 
     const rawText = await extractCvText(doc.filename, doc.storedPath);
     if (!rawText || rawText.length < 20) {
-      throw new Error("Could not extract readable text from the CV (scanned/image-only PDFs are not supported)");
+      throw new Error(
+        "Could not extract readable text from the CV. If it is a scanned document or an image-only PDF, " +
+        "export it to text/Word, or upload it as JPG/PNG photos (OCR is supported)"
+      );
     }
 
     await db.cvAnalysis.update({ where: { candidateId }, data: { rawText: rawText.slice(0, 60000), progress: "AI parsing CV structure", ...hb() } });

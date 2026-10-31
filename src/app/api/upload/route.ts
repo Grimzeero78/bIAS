@@ -16,7 +16,11 @@ const MAX_VIDEO_BYTES = 200 * 1024 * 1024; // 200 MB
 // so raw interview videos are capped tighter — browser-prepared analysis
 // manifests are unaffected (they hold the evidence the AI actually uses).
 const MAX_VIDEO_BYTES_D1 = 48 * 1024 * 1024; // 48 MB
-const CV_TYPES = [".pdf", ".docx", ".doc", ".txt", ".md"];
+// CVs: accept ANY format. The extraction layer (src/lib/ai/cv-extract.ts)
+// handles pdf, docx, doc, txt, md, html, rtf, odt, ods, odp, pptx, xlsx,
+// epub, pages, csv, json, xml, log, tex and image OCR — and unknown formats
+// fall through to best-effort text scraping. Unreadable uploads fail later
+// with a helpful analysis error instead of a hard upload rejection.
 const VIDEO_TYPES = [".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"];
 
 // POST /api/upload  (multipart: candidateId, docType=CV|VIDEO, file)
@@ -36,9 +40,9 @@ export async function POST(req: NextRequest) {
     const user = await requireJobAccess(cand.jobId);
 
     const ext = file.name.toLowerCase().replace(/.*(\.[^.]+)$/, "$1") || "";
-    const exts = docType === "CV" ? CV_TYPES : VIDEO_TYPES;
-    if (!exts.some((e) => ext.endsWith(e))) {
-      throw new HttpError(400, `Unsupported ${docType} format ${ext || "(none)"} — allowed: ${exts.join(", ")}`);
+    // Any CV format is accepted; video stays restricted to real media files.
+    if (docType !== "CV" && !VIDEO_TYPES.some((e) => ext.endsWith(e))) {
+      throw new HttpError(400, `Unsupported ${docType} format ${ext || "(none)"} — allowed: ${VIDEO_TYPES.join(", ")}`);
     }
     const max =
       docType === "CV"

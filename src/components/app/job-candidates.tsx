@@ -259,7 +259,7 @@ function CandidateCard({ c, index, onChanged, onOpenReport }: { c: CandidateRow;
       <div className="mt-4 grid gap-2.5 sm:grid-cols-2">
         <EvidenceSlot
           icon={<FileText className="h-4 w-4 text-cyan-300" />}
-          label="CV"
+          label="CV — any format"
           doc={c.documents.find((d) => d.type === "CV")}
           analysis={c.cv ? { status: c.cv.status, progress: c.cv.progress, error: c.cv.error } : null}
           score={c.cv?.overallScore ?? null}
@@ -317,7 +317,6 @@ function CandidateCard({ c, index, onChanged, onOpenReport }: { c: CandidateRow;
       <input
         ref={cvInput}
         type="file"
-        accept=".pdf,.docx,.doc,.txt,.md"
         className="hidden"
         onChange={(e) => {
           const f = e.target.files?.[0];

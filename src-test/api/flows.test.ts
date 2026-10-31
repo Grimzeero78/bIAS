@@ -156,13 +156,28 @@ describe("candidates + access codes", () => {
 });
 
 describe("upload validation", () => {
-  test("rejects disallowed CV types", async () => {
+  test("accepts ANY CV format (html/rtf/unknown) — no extension gate", async () => {
+    // The user-facing contract: never reject a CV by extension. Unreadable
+    // payloads fail later as a clean analysis error, not an upload rejection.
+    for (const name of ["cv.html", "cv.rtf", "cv.weirdunknown"]) {
+      const fd = new FormData();
+      fd.set("candidateId", candidateId);
+      fd.set("docType", "CV");
+      fd.set("file", new File(["<p>Analyst CV</p>"], name, { type: "application/octet-stream" }));
+      const r = await call("panel", "POST", "/api/upload", fd);
+      expect([200, 400]).toContain(r.status);
+      if (r.status === 400) expect(String(r.json?.error)).not.toContain("Unsupported");
+    }
+  });
+
+  test("video upload still rejects non-media extensions", async () => {
     const fd = new FormData();
     fd.set("candidateId", candidateId);
-    fd.set("docType", "CV");
-    fd.set("file", new File(["malicious"], "evil.exe", { type: "application/octet-stream" }));
+    fd.set("docType", "VIDEO");
+    fd.set("file", new File(["not-a-video"], "clip.txt", { type: "text/plain" }));
     const r = await call("panel", "POST", "/api/upload", fd);
     expect(r.status).toBe(400);
+    expect(String(r.json?.error)).toContain("Unsupported");
   });
 
   test("rejects oversized video manifest claims", async () => {
